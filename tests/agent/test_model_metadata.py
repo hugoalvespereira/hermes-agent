@@ -430,6 +430,54 @@ class TestCodexOAuthContextLength:
         assert ctx_55 == 300_000
         assert ctx_54 == 400_000
 
+    def test_gpt56_fallback_matches_authoritative_live_family(self):
+        """The offline GPT-5.6 fallback must mirror the live Codex catalog.
+
+        This is a relationship test, not a catalog snapshot: one mocked live
+        family establishes the provider contract, then every offline alias must
+        preserve the same context window when the probe is unavailable.
+        """
+        from agent import model_metadata as mm
+
+        live_context = 372_000
+        variants = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [
+                {"slug": model, "context_window": live_context}
+                for model in variants
+            ]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            live_values = {
+                model: mm.get_model_context_length(
+                    model=model,
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_key="fake-token",
+                    provider="openai-codex",
+                )
+                for model in variants
+            }
+
+            mm._codex_oauth_context_cache = {}
+            mm._codex_oauth_context_cache_time = 0.0
+            fallback_values = {
+                model: mm.get_model_context_length(
+                    model=model,
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_key="",
+                    provider="openai-codex",
+                )
+                for model in variants
+            }
+
+        assert set(live_values.values()) == {live_context}
+        assert fallback_values == live_values
+
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return
         the hardcoded 272k rather than leaking through to models.dev 1.05M."""

@@ -230,7 +230,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
     # This hardcoded value is only reached when every probe misses.
     # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
-    # OpenAI API (same as gpt-5.5). Codex OAuth caps these at 272K.
+    # OpenAI API (same as gpt-5.5). Codex OAuth reports 372K for these slugs.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
@@ -1824,7 +1824,8 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 
 
 # Known ChatGPT Codex OAuth context windows (observed via live
-# chatgpt.com/backend-api/codex/models probe, Apr 2026). These are the
+# chatgpt.com/backend-api/codex/models probes; GPT-5.6 refreshed Jul 2026).
+# These are the
 # `context_window` values, which are what Codex actually enforces — the
 # direct OpenAI API has larger limits for the same slugs, but Codex OAuth
 # caps lower (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex).
@@ -1843,9 +1844,9 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.3-codex-spark": 128_000,
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
-    "gpt-5.6-sol": 272_000,
-    "gpt-5.6-terra": 272_000,
-    "gpt-5.6-luna": 272_000,
+    "gpt-5.6-sol": 372_000,
+    "gpt-5.6-terra": 372_000,
+    "gpt-5.6-luna": 372_000,
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
