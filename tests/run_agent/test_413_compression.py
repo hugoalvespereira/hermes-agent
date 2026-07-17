@@ -647,8 +647,8 @@ class TestPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
         agent.context_compressor.last_prompt_tokens = 58_000
-        agent.context_compressor.last_real_prompt_tokens = 58_000
-        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.begin_request_calibration(113_000)
+        agent.context_compressor.update_from_response({"prompt_tokens": 58_000})
 
         big_history = []
         for i in range(20):
@@ -677,6 +677,8 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
         assert result["final_response"] == "Used real fit"
+        assert agent.context_compressor.matched_request_rough_tokens == 114_000
+        assert agent.context_compressor.matched_prompt_tokens == 59_000
         assert not any(
             ev == "lifecycle" and "Preflight compression" in msg
             for ev, msg in status_messages
@@ -688,8 +690,8 @@ class TestPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
         agent.context_compressor.last_prompt_tokens = 58_000
-        agent.context_compressor.last_real_prompt_tokens = 58_000
-        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.begin_request_calibration(113_000)
+        agent.context_compressor.update_from_response({"prompt_tokens": 58_000})
 
         big_history = []
         for i in range(20):
@@ -714,7 +716,7 @@ class TestPreflightCompression:
 
         def _rough_estimate(*_args, **_kwargs):
             _rough_calls["n"] += 1
-            return 125_000 if _rough_calls["n"] == 1 else 40_000
+            return 170_000 if _rough_calls["n"] == 1 else 40_000
 
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),

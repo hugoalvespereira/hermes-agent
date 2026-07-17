@@ -69,18 +69,17 @@ class TestUpdateFromResponse:
 class TestPreflightDeferral:
     def test_defers_when_recent_real_usage_fit_and_rough_growth_is_small(self, compressor):
         compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
+        compressor.begin_request_calibration(90_000)
+        compressor.update_from_response({"prompt_tokens": 50_000})
 
         assert compressor.should_defer_preflight_to_real_usage(93_000) is True
-        assert compressor.last_rough_tokens_when_real_prompt_fit == 93_000
 
     def test_does_not_defer_when_rough_growth_is_large(self, compressor):
         compressor.threshold_tokens = 85_000
-        compressor.last_real_prompt_tokens = 50_000
-        compressor.last_rough_tokens_when_real_prompt_fit = 90_000
+        compressor.begin_request_calibration(90_000)
+        compressor.update_from_response({"prompt_tokens": 50_000})
 
-        assert compressor.should_defer_preflight_to_real_usage(100_000) is False
+        assert compressor.should_defer_preflight_to_real_usage(130_000) is False
 
     def test_does_not_defer_without_recent_real_usage(self, compressor):
         compressor.threshold_tokens = 85_000
@@ -2851,8 +2850,8 @@ class TestUpdateModelResetsCalibration:
         """The exact #23767 failure: old model's 'it fit' must not defer
         preflight on the new smaller model."""
         comp = self._comp()
-        comp.last_real_prompt_tokens = 50_000
-        comp.last_rough_tokens_when_real_prompt_fit = 90_000
+        comp.begin_request_calibration(90_000)
+        comp.update_from_response({"prompt_tokens": 50_000})
         # Before switch, a modest rough growth would defer.
         comp.threshold_tokens = 85_000
         assert comp.should_defer_preflight_to_real_usage(93_000) is True

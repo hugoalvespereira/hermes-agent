@@ -994,18 +994,18 @@ def run_conversation(
         # case. Re-check here against the current request estimate.
         #
         # Mirror the turn-prologue preflight's guard chain exactly (see
-        # turn_context.py): (1) defer when the rough estimate is known-noisy
-        # relative to a recent real provider prompt that fit under threshold
-        # (schema overhead / post-compaction over-count, #36718); (2) skip
-        # while a same-session compression-failure cooldown is active; (3) then
+        # turn_context.py): (1) derive canonical pressure from the last matched
+        # rough/provider pair (or defer for the post-compaction sentinel); (2)
+        # skip while a same-session compression-failure cooldown is active; (3) then
         # should_compress() — reusing the canonical threshold_tokens (output
         # room already reserved by _compute_threshold_tokens) and its summary-
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+        _calibrated_pressure = getattr(
+            _compressor, "calibrated_pressure_tokens", lambda tokens: tokens
         )
+        calibrated_request_pressure = _calibrated_pressure(request_pressure_tokens)
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
@@ -1013,14 +1013,15 @@ def run_conversation(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < 3
-            and not _defer_preflight(request_pressure_tokens)
+            and calibrated_request_pressure is not None
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and _compressor.should_compress(calibrated_request_pressure)
         ):
             compression_attempts += 1
             logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/3)",
+                "Pre-API compression: calibrated pressure ~%s tokens "
+                "(rough ~%s) >= %s threshold (context=%s, attempt=%s/3)",
+                f"{calibrated_request_pressure:,}",
                 f"{request_pressure_tokens:,}",
                 f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
@@ -1332,22 +1333,37 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
+                _begin_request_calibration = getattr(
+                    agent.context_compressor,
+                    "begin_request_calibration",
+                    lambda _tokens: None,
                 )
+                _discard_request_calibration = getattr(
+                    agent.context_compressor,
+                    "discard_request_calibration",
+                    lambda: None,
+                )
+                _begin_request_calibration(request_pressure_tokens)
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                except BaseException:
+                    _discard_request_calibration()
+                    raise
                 
                 api_duration = time.time() - api_start_time
                 
@@ -1448,6 +1464,7 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _discard_request_calibration()
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -1607,6 +1624,37 @@ def run_conversation(
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
                     continue  # Retry the API call
+
+                # The response is valid: pair this provider's reported prompt
+                # usage with the rough estimate captured immediately before the
+                # exact request was sent. Do this before finish/content handling,
+                # because valid refusal and output-limit responses can return
+                # early below and must still replace the prior calibration.
+                _response_usage = getattr(response, "usage", None)
+                if _response_usage:
+                    _calibration_usage = normalize_usage(
+                        _response_usage,
+                        provider=agent.provider,
+                        api_mode=agent.api_mode,
+                    )
+                    agent.context_compressor.update_from_response({
+                        "prompt_tokens": _calibration_usage.prompt_tokens,
+                        "completion_tokens": _calibration_usage.output_tokens,
+                        "total_tokens": _calibration_usage.total_tokens,
+                        "input_tokens": _calibration_usage.input_tokens,
+                        "output_tokens": _calibration_usage.output_tokens,
+                        "cache_read_tokens": _calibration_usage.cache_read_tokens,
+                        "cache_write_tokens": _calibration_usage.cache_write_tokens,
+                        "reasoning_tokens": _calibration_usage.reasoning_tokens,
+                    })
+                else:
+                    _discard_request_calibration()
+                    if getattr(
+                        agent.context_compressor,
+                        "awaiting_real_usage_after_compression",
+                        False,
+                    ):
+                        agent.context_compressor.update_from_response({})
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -2118,18 +2166,6 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    agent.context_compressor.update_from_response(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
-                ):
-                    # A response with no usage cannot adjudicate whether the
-                    # prior compaction cleared the threshold. Consume the pending
-                    # verdict now so a much later, unrelated reading is not
-                    # charged to that old compaction, and so preflight deferral
-                    # does not remain latched indefinitely.
-                    agent.context_compressor.update_from_response({})
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.

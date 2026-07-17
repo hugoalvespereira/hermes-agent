@@ -140,7 +140,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -758,6 +758,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_error TEXT,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
+    compaction_calibration_identity TEXT,
+    compaction_calibration_rough_tokens INTEGER,
+    compaction_calibration_prompt_tokens INTEGER,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -2272,6 +2275,80 @@ class SessionDB:
                 "clear_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+
+    def record_compaction_calibration(
+        self,
+        session_id: str,
+        *,
+        identity: Dict[str, Any],
+        rough_tokens: int,
+        prompt_tokens: int,
+    ) -> None:
+        """Persist one matched rough/provider prompt-token pair for a session."""
+        if not session_id or rough_tokens <= 0 or prompt_tokens <= 0:
+            return
+        identity_json = json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compaction_calibration_identity = ?, "
+                "compaction_calibration_rough_tokens = ?, "
+                "compaction_calibration_prompt_tokens = ? WHERE id = ?",
+                (identity_json, int(rough_tokens), int(prompt_tokens), session_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_compaction_calibration(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a complete persisted calibration pair, or ``None``."""
+        if not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT compaction_calibration_identity, "
+                "compaction_calibration_rough_tokens, "
+                "compaction_calibration_prompt_tokens "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            identity = json.loads(row["compaction_calibration_identity"] or "")
+            rough_tokens = int(row["compaction_calibration_rough_tokens"] or 0)
+            prompt_tokens = int(row["compaction_calibration_prompt_tokens"] or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(identity, dict) or rough_tokens <= 0 or prompt_tokens <= 0:
+            return None
+        return {
+            "identity": identity,
+            "rough_tokens": rough_tokens,
+            "prompt_tokens": prompt_tokens,
+        }
+
+    def clear_compaction_calibration(self, session_id: str) -> None:
+        """Clear the persisted matched pair at a true session boundary."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compaction_calibration_identity = NULL, "
+                "compaction_calibration_rough_tokens = NULL, "
+                "compaction_calibration_prompt_tokens = NULL WHERE id = ?",
+                (session_id,),
+            )
+
+        self._execute_write(_do)
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────

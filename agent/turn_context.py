@@ -377,12 +377,13 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
-        _defer_preflight = getattr(
+        _calibrated_pressure = getattr(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            "calibrated_pressure_tokens",
+            lambda tokens: tokens,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
+        _preflight_pressure = _calibrated_pressure(_preflight_tokens)
+        _preflight_deferred = _preflight_pressure is None
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _codex_native_auto = (
@@ -400,9 +401,10 @@ def build_turn_context(
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
-            if _last >= 0 and _preflight_tokens > _last:
-                _compressor.last_prompt_tokens = _preflight_tokens
+            # Do NOT overwrite the -1 sentinel (#36718). Display canonical
+            # pressure rather than the noisy absolute rough estimate.
+            if _last >= 0 and _preflight_pressure > _last:
+                _compressor.last_prompt_tokens = _preflight_pressure
 
         _compression_cooldown = getattr(
             _compressor,
@@ -412,11 +414,10 @@ def build_turn_context(
 
         if _preflight_deferred:
             logger.info(
-                "Skipping preflight compression: rough estimate ~%s >= %s, "
-                "but last real provider prompt was %s after compression",
+                "Skipping preflight compression while awaiting provider usage "
+                "for the just-compacted request (rough ~%s, threshold %s)",
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
-                f"{_compressor.last_real_prompt_tokens:,}",
             )
         elif _compression_cooldown:
             logger.info(
@@ -431,9 +432,11 @@ def build_turn_context(
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_preflight_tokens):
+        elif _compressor.should_compress(_preflight_pressure):
             logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                "Preflight compression: calibrated pressure ~%s tokens "
+                "(rough ~%s) >= %s threshold (model %s, ctx %s)",
+                f"{_preflight_pressure:,}",
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
                 agent.model,
@@ -472,7 +475,11 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                _preflight_pressure = _calibrated_pressure(_preflight_tokens)
+                if (
+                    _preflight_pressure is None
+                    or not _compressor.should_compress(_preflight_pressure)
+                ):
                     break
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
