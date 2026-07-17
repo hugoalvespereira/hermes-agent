@@ -1260,6 +1260,7 @@ class ContextCompressor(ContextEngine):
         effective_output_cap: Any = _CALIBRATION_UNSET,
     ) -> Dict[str, Any]:
         """Return the runtime identity to which a matched pair is bound."""
+        self._ensure_calibration_runtime_state()
         base_url = str(getattr(self, "base_url", "") or "")
         return {
             "model": str(getattr(self, "model", "") or ""),
@@ -1284,6 +1285,37 @@ class ContextCompressor(ContextEngine):
             ),
         }
 
+    def _ensure_calibration_runtime_state(self) -> threading.RLock:
+        """Lazily hydrate attempt state for legacy/unpickled compressors.
+
+        Some compatibility paths and tests construct ``ContextCompressor``
+        without running the current ``__init__``. Session reset must remain
+        fail-closed instead of skipping all cleanup because one new field is
+        absent.
+        """
+        lock = getattr(self, "_calibration_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._calibration_lock = lock
+        with lock:
+            if not isinstance(getattr(self, "_pending_calibration_attempts", None), dict):
+                self._pending_calibration_attempts = {}
+            if not isinstance(getattr(self, "_local_calibration_sequence", None), int):
+                self._local_calibration_sequence = 0
+            if not isinstance(getattr(self, "matched_calibration_sequence", None), int):
+                self.matched_calibration_sequence = 0
+            if not hasattr(self, "matched_request_rough_tokens"):
+                self.matched_request_rough_tokens = 0
+            if not hasattr(self, "matched_prompt_tokens"):
+                self.matched_prompt_tokens = 0
+            if not hasattr(self, "matched_calibration_identity"):
+                self.matched_calibration_identity = None
+            if not hasattr(self, "_current_prompt_tool_fingerprint"):
+                self._current_prompt_tool_fingerprint = ""
+            if not hasattr(self, "_current_effective_output_cap"):
+                self._current_effective_output_cap = getattr(self, "max_tokens", None)
+        return lock
+
     def set_request_calibration_shape(
         self,
         prompt_tool_fingerprint: str,
@@ -1291,7 +1323,7 @@ class ContextCompressor(ContextEngine):
         effective_output_cap: Any = _CALIBRATION_UNSET,
     ) -> None:
         """Set the current stable request shape and invalidate an incompatible pair."""
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             self._current_prompt_tool_fingerprint = str(prompt_tool_fingerprint or "")
             if effective_output_cap is not _CALIBRATION_UNSET:
                 self._current_effective_output_cap = self._coerce_max_tokens(
@@ -1305,7 +1337,7 @@ class ContextCompressor(ContextEngine):
 
     def _clear_matched_calibration(self, *, persist: bool) -> None:
         """Clear in-memory calibration and optionally its bound session row."""
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             self.matched_request_rough_tokens = 0
             self.matched_prompt_tokens = 0
             self.matched_calibration_identity = None
@@ -1365,7 +1397,7 @@ class ContextCompressor(ContextEngine):
                 attempt_id = int(allocated) if isinstance(allocated, int) else 0
             except Exception:
                 logger.debug("compaction calibration sequence allocation failed", exc_info=True)
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             if attempt_id <= 0:
                 self._local_calibration_sequence += 1
                 attempt_id = self._local_calibration_sequence
@@ -1374,7 +1406,7 @@ class ContextCompressor(ContextEngine):
 
     def discard_request_calibration(self, attempt_id: Optional[int] = None) -> None:
         """Drop an unpaired estimate after a failed or abandoned request."""
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             if attempt_id is None:
                 self._pending_calibration_attempts.clear()
             else:
@@ -1412,7 +1444,7 @@ class ContextCompressor(ContextEngine):
         calibration_attempt_id: Optional[int] = None,
     ):
         """Update tracked token usage from API response."""
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             if calibration_attempt_id is None and len(self._pending_calibration_attempts) == 1:
                 calibration_attempt_id = next(iter(self._pending_calibration_attempts))
             pending = (
@@ -1429,7 +1461,7 @@ class ContextCompressor(ContextEngine):
             self.last_real_prompt_tokens = response_prompt_tokens
             if pending_rough_tokens > 0 and pending_identity is not None:
                 attempt_sequence = int(calibration_attempt_id or 0)
-                with self._calibration_lock:
+                with self._ensure_calibration_runtime_state():
                     if (
                         attempt_sequence >= self.matched_calibration_sequence
                         and pending_identity == self._calibration_identity()
@@ -1499,7 +1531,7 @@ class ContextCompressor(ContextEngine):
         overhead cannot trigger compaction while genuinely new tool output can.
         ``None`` retains the one-call post-compaction deferral sentinel.
         """
-        with self._calibration_lock:
+        with self._ensure_calibration_runtime_state():
             if self.awaiting_real_usage_after_compression:
                 return None
             if (

@@ -385,7 +385,7 @@ def build_turn_context(
         )
         _preflight_output_cap = (
             getattr(agent, "_ephemeral_max_output_tokens", None)
-            or agent.max_tokens
+            or getattr(agent, "max_tokens", None)
         )
         if callable(_set_calibration_shape):
             _set_calibration_shape(
