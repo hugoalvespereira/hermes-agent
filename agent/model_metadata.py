@@ -4,6 +4,7 @@ Pure utility functions with no AIAgent dependency. Used by ContextCompressor
 and run_agent.py for pre-flight context checks.
 """
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -2616,6 +2617,131 @@ def estimate_request_tokens_rough(
     return total
 
 
+# Bump whenever the provider-payload estimator or prompt/tool shape
+# canonicalization changes. Durable calibration pairs include this value so a
+# release cannot silently reuse measurements produced by different accounting.
+REQUEST_TOKEN_ESTIMATOR_VERSION = 2
+
+
+def _canonical_tool_shape(tool: Any) -> Any:
+    """Return the provider-independent semantic shape of one tool schema."""
+    if not isinstance(tool, dict):
+        return tool
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return {
+            "type": tool.get("type") or "function",
+            "name": function.get("name"),
+            "description": function.get("description"),
+            "parameters": function.get("parameters"),
+            "strict": bool(function.get("strict", False)),
+        }
+    return {
+        "type": tool.get("type") or "function",
+        "name": tool.get("name"),
+        "description": tool.get("description"),
+        "parameters": tool.get("parameters"),
+        "strict": bool(tool.get("strict", False)),
+    }
+
+
+def _request_prompt_shape(request: Dict[str, Any]) -> Any:
+    instructions = request.get("instructions")
+    if instructions not in (None, ""):
+        return instructions.strip() if isinstance(instructions, str) else instructions
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        messages = request.get("input")
+    if not isinstance(messages, list):
+        return ""
+    prompt_rows = [
+        {"role": message.get("role"), "content": message.get("content")}
+        for message in messages
+        if isinstance(message, dict) and message.get("role") in {"system", "developer"}
+    ]
+    if len(prompt_rows) == 1 and prompt_rows[0]["role"] == "system":
+        content = prompt_rows[0]["content"]
+        return content.strip() if isinstance(content, str) else content
+    return prompt_rows
+
+
+def request_prompt_tool_fingerprint(request: Dict[str, Any]) -> str:
+    """Hash only the stable prompt/tool representation of a provider request.
+
+    Conversation rows are deliberately excluded: ordinary turn growth is what
+    matched calibration measures. The hash itself is safe to persist; prompt and
+    tool contents never leave this function.
+    """
+    if not isinstance(request, dict):
+        request = {}
+    shape = {
+        "prompt": _request_prompt_shape(request),
+        "tools": [_canonical_tool_shape(tool) for tool in request.get("tools") or []],
+    }
+    encoded = json.dumps(
+        shape,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def effective_output_cap_from_request(request: Dict[str, Any]) -> Optional[int]:
+    """Return the positive provider-facing output cap from final request kwargs."""
+    if not isinstance(request, dict):
+        return None
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        raw = request.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _serialized_length_for_token_estimate(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
+    except Exception:
+        return len(str(value))
+
+
+def estimate_provider_request_tokens_rough(
+    request: Dict[str, Any], *, provider: str = "", api_mode: str = ""
+) -> int:
+    """Estimate the exact request shape at the terminal transport boundary.
+
+    The input is already provider-normalized. Codex ``input`` items (including
+    replayed reasoning records) therefore must not be converted a second time.
+    """
+    if not isinstance(request, dict):
+        return 0
+    messages = request.get("input")
+    if not isinstance(messages, list):
+        messages = request.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    total = estimate_messages_tokens_rough(messages)
+    instructions = request.get("instructions")
+    if instructions not in (None, ""):
+        total += (_serialized_length_for_token_estimate(instructions) + 3) // 4
+    tools = request.get("tools")
+    if isinstance(tools, list) and tools:
+        # This is the terminal payload, potentially replaced by execution
+        # middleware. Do not use the identity cache: a transient list can reuse
+        # an old Python id and must still be measured from its exact contents.
+        total += _estimate_tools_tokens_rough_uncached(tools)
+    return total
+
+
 # NOTE: tool schemas can be large. Avoid repeated `str(tools)` conversions,
 # which are CPU-heavy and can stall GUI event loops under GIL pressure.
 #
@@ -2639,26 +2765,7 @@ def _tool_name_for_cache(tool: Any) -> str:
     return name if isinstance(name, str) else ""
 
 
-def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
-    if not tools:
-        return 0
-
-    # Cache by list identity. Tools are rebuilt rarely (toolset changes),
-    # but token estimates are requested frequently (preflight, compaction).
-    key = id(tools)
-    n = len(tools)
-    first = _tool_name_for_cache(tools[0]) if n else ""
-    last = _tool_name_for_cache(tools[-1]) if n else ""
-
-    cached = _TOOLS_TOKENS_CACHE.get(key)
-    if cached is not None:
-        cached_n, cached_first, cached_last, cached_tokens = cached
-        if cached_n == n and cached_first == first and cached_last == last:
-            return cached_tokens
-
-    # Fast, stable rough estimate: sum lengths of the major schema fields.
-    # This avoids the pathological `str(tools)` path while still scaling with
-    # schema size (descriptions + parameters dominate).
+def _estimate_tools_tokens_rough_uncached(tools: List[Dict[str, Any]]) -> int:
     total_chars = 0
     for tool in tools:
         if not isinstance(tool, dict):
@@ -2677,13 +2784,33 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
             total_chars += len(name)
         if isinstance(desc, str):
             total_chars += len(desc)
-        # Parameters can be nested; JSON is closer to over-the-wire size than repr().
         try:
-            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+            total_chars += len(
+                json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+            )
         except Exception:
             total_chars += len(str(params))
+    return (total_chars + 3) // 4
 
-    tokens = (total_chars + 3) // 4
+
+def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
+    if not tools:
+        return 0
+
+    # Cache by list identity. Tools are rebuilt rarely (toolset changes),
+    # but token estimates are requested frequently (preflight, compaction).
+    key = id(tools)
+    n = len(tools)
+    first = _tool_name_for_cache(tools[0]) if n else ""
+    last = _tool_name_for_cache(tools[-1]) if n else ""
+
+    cached = _TOOLS_TOKENS_CACHE.get(key)
+    if cached is not None:
+        cached_n, cached_first, cached_last, cached_tokens = cached
+        if cached_n == n and cached_first == first and cached_last == last:
+            return cached_tokens
+
+    tokens = _estimate_tools_tokens_rough_uncached(tools)
     # Bound the cache: drop the oldest entry when the cap is exceeded so a
     # long-running process can't accumulate an unbounded number of stale
     # ``id(tools)`` entries (id values are recycled after GC anyway).

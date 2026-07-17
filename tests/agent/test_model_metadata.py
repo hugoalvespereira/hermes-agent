@@ -31,6 +31,8 @@ from agent.model_metadata import (
     fetch_model_metadata,
     _MODEL_CACHE_TTL,
     estimate_request_tokens_rough,
+    estimate_provider_request_tokens_rough,
+    request_prompt_tool_fingerprint,
 )
 
 
@@ -204,6 +206,48 @@ class TestEstimateRequestTokensRough:
         )
 
         assert embedded == explicit
+
+    def test_terminal_codex_payload_counts_reasoning_replay_without_reconversion(self):
+        payload = {
+            "instructions": "system",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "encrypted_content": "enc_" + "x" * 4000},
+            ],
+        }
+        without_replay = {**payload, "input": payload["input"][:1]}
+
+        assert estimate_provider_request_tokens_rough(
+            payload, provider="openai-codex", api_mode="codex_responses"
+        ) > estimate_provider_request_tokens_rough(
+            without_replay, provider="openai-codex", api_mode="codex_responses"
+        )
+
+    def test_prompt_tool_fingerprint_matches_chat_and_codex_function_shapes(self):
+        schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+        chat = {
+            "messages": [{"role": "system", "content": "  system  "}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "demo",
+                    "description": "tool",
+                    "parameters": schema,
+                },
+            }],
+        }
+        codex = {
+            "instructions": "system",
+            "tools": [{
+                "type": "function",
+                "name": "demo",
+                "description": "tool",
+                "parameters": schema,
+                "strict": False,
+            }],
+        }
+
+        assert request_prompt_tool_fingerprint(chat) == request_prompt_tool_fingerprint(codex)
 
     def test_non_codex_estimator_keeps_existing_internal_shape(self):
         messages = [{"role": "assistant", "content": "ok", "reasoning": "r" * 400}]

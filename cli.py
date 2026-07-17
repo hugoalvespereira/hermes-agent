@@ -7261,6 +7261,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Extract the message text and remove everything from that point forward
         last_message = self.conversation_history[last_user_idx].get("content", "")
         self.conversation_history = self.conversation_history[:last_user_idx]
+        compressor = getattr(getattr(self, "agent", None), "context_compressor", None)
+        invalidate = getattr(compressor, "invalidate_matched_calibration", None)
+        if callable(invalidate):
+            invalidate()
         
         print(f"(^_^)b Retrying: \"{last_message[:60]}{'...' if len(last_message) > 60 else ''}\"")
         return last_message
@@ -7317,6 +7321,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Truncate the in-memory history to before that user message.
         self.conversation_history = self.conversation_history[:cut_idx]
+        compressor = getattr(getattr(self, "agent", None), "context_compressor", None)
+        invalidate = getattr(compressor, "invalidate_matched_calibration", None)
+        if callable(invalidate):
+            invalidate()
 
         # Soft-delete the truncated rows on disk so re-prompts and search
         # see the clean transcript while the rows survive for audit.

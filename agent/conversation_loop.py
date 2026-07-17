@@ -49,11 +49,14 @@ from agent.message_sanitization import (
 )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    effective_output_cap_from_request,
     estimate_messages_tokens_rough,
+    estimate_provider_request_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    request_prompt_tool_fingerprint,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -970,7 +973,6 @@ def run_conversation(
             provider=agent.provider or "",
             api_mode=agent.api_mode or "",
         )
-        request_pressure_route = (agent.provider or "", agent.api_mode or "")
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -1006,6 +1008,21 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _preflight_shape = request_prompt_tool_fingerprint({
+            "messages": api_messages,
+            "tools": agent.tools or [],
+        })
+        _preflight_output_cap = getattr(
+            agent, "_ephemeral_max_output_tokens", None
+        ) or agent.max_tokens
+        _set_calibration_shape = getattr(
+            _compressor, "set_request_calibration_shape", None
+        )
+        if callable(_set_calibration_shape):
+            _set_calibration_shape(
+                _preflight_shape,
+                effective_output_cap=_preflight_output_cap,
+            )
         _calibrated_pressure = getattr(
             _compressor, "calibrated_pressure_tokens", lambda tokens: tokens
         )
@@ -1019,7 +1036,13 @@ def run_conversation(
             and compression_attempts < 3
             and calibrated_request_pressure is not None
             and not _compression_cooldown
-            and _compressor.should_compress(calibrated_request_pressure)
+            and (
+                getattr(
+                    _compressor,
+                    "should_compress_for_output_cap",
+                    lambda tokens, _cap: _compressor.should_compress(tokens),
+                )(calibrated_request_pressure, _preflight_output_cap)
+            )
         ):
             compression_attempts += 1
             logger.info(
@@ -1324,45 +1347,68 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                calibration_attempt_id = None
+
+                _begin_request_calibration = getattr(
+                    agent.context_compressor,
+                    "begin_request_calibration",
+                    lambda _tokens, **_kwargs: None,
+                )
+                _discard_request_calibration = getattr(
+                    agent.context_compressor,
+                    "discard_request_calibration",
+                    lambda _attempt_id=None: None,
+                )
+
+                def _discard_calibration_attempt():
+                    try:
+                        _discard_request_calibration(calibration_attempt_id)
+                    except TypeError:
+                        # Source compatibility for context-engine plugins that
+                        # implemented the pre-attempt no-argument hook.
+                        _discard_request_calibration()
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal calibration_attempt_id
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                    final_rough_tokens = estimate_provider_request_tokens_rough(
+                        next_api_kwargs,
+                        provider=agent.provider or "",
+                        api_mode=agent.api_mode or "",
+                    )
+                    try:
+                        calibration_attempt_id = _begin_request_calibration(
+                            final_rough_tokens,
+                            prompt_tool_fingerprint=request_prompt_tool_fingerprint(
+                                next_api_kwargs
+                            ),
+                            effective_output_cap=effective_output_cap_from_request(
+                                next_api_kwargs
+                            ),
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    except TypeError:
+                        # Older plugin engines accepted only the rough token
+                        # positional argument. They retain their legacy behavior.
+                        calibration_attempt_id = _begin_request_calibration(
+                            final_rough_tokens
+                        )
+                    try:
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
+                    except BaseException:
+                        _discard_calibration_attempt()
+                        raise
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                _begin_request_calibration = getattr(
-                    agent.context_compressor,
-                    "begin_request_calibration",
-                    lambda _tokens: None,
-                )
-                _discard_request_calibration = getattr(
-                    agent.context_compressor,
-                    "discard_request_calibration",
-                    lambda: None,
-                )
-                calibration_rough_tokens = request_pressure_tokens
-                current_pressure_route = (agent.provider or "", agent.api_mode or "")
-                if current_pressure_route != request_pressure_route:
-                    # A retry may activate a provider fallback whose wire shape
-                    # differs from the primary request (notably chat-completions
-                    # versus Codex Responses). Pair real usage with an estimate
-                    # produced for the route that is actually being called.
-                    calibration_rough_tokens = estimate_request_tokens_rough(
-                        api_messages,
-                        tools=agent.tools or None,
-                        provider=current_pressure_route[0],
-                        api_mode=current_pressure_route[1],
-                    )
-                _begin_request_calibration(calibration_rough_tokens)
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -1381,7 +1427,7 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 except BaseException:
-                    _discard_request_calibration()
+                    _discard_calibration_attempt()
                     raise
                 
                 api_duration = time.time() - api_start_time
@@ -1483,7 +1529,7 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
-                    _discard_request_calibration()
+                    _discard_calibration_attempt()
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -1656,7 +1702,7 @@ def run_conversation(
                         provider=agent.provider,
                         api_mode=agent.api_mode,
                     )
-                    agent.context_compressor.update_from_response({
+                    _calibration_usage_dict = {
                         "prompt_tokens": _calibration_usage.prompt_tokens,
                         "completion_tokens": _calibration_usage.output_tokens,
                         "total_tokens": _calibration_usage.total_tokens,
@@ -1665,9 +1711,18 @@ def run_conversation(
                         "cache_read_tokens": _calibration_usage.cache_read_tokens,
                         "cache_write_tokens": _calibration_usage.cache_write_tokens,
                         "reasoning_tokens": _calibration_usage.reasoning_tokens,
-                    })
+                    }
+                    if calibration_attempt_id is None:
+                        agent.context_compressor.update_from_response(
+                            _calibration_usage_dict
+                        )
+                    else:
+                        agent.context_compressor.update_from_response(
+                            _calibration_usage_dict,
+                            calibration_attempt_id=calibration_attempt_id,
+                        )
                 else:
-                    _discard_request_calibration()
+                    _discard_calibration_attempt()
                     if getattr(
                         agent.context_compressor,
                         "awaiting_real_usage_after_compression",

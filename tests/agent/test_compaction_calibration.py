@@ -4,6 +4,7 @@ import sqlite3
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
+from agent.model_metadata import request_prompt_tool_fingerprint
 from hermes_state import SessionDB
 
 
@@ -37,12 +38,22 @@ def _record_success(
     rough_tokens: int,
     prompt_tokens: int,
 ) -> None:
-    compressor.begin_request_calibration(rough_tokens)
+    attempt_id = compressor.begin_request_calibration(rough_tokens)
     compressor.update_from_response(
         {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": 100,
             "total_tokens": prompt_tokens + 100,
+        },
+        calibration_attempt_id=attempt_id,
+    )
+
+
+def _shape(label: str = "stable") -> str:
+    return request_prompt_tool_fingerprint(
+        {
+            "messages": [{"role": "system", "content": f"prompt-{label}"}],
+            "tools": [{"type": "function", "function": {"name": f"tool-{label}"}}],
         }
     )
 
@@ -89,14 +100,110 @@ def test_without_matched_pair_pressure_remains_conservative_absolute_rough() -> 
 
 def test_failed_request_estimate_is_not_paired_with_later_usage() -> None:
     compressor = _compressor()
-    compressor.begin_request_calibration(290_282)
-    compressor.discard_request_calibration()
+    attempt_id = compressor.begin_request_calibration(290_282)
+    compressor.discard_request_calibration(attempt_id)
 
     compressor.update_from_response(
         {"prompt_tokens": 201_860, "completion_tokens": 100, "total_tokens": 201_960}
     )
 
     assert compressor.calibrated_pressure_tokens(290_458) == 290_458
+
+
+def test_out_of_order_responses_pair_only_with_their_exact_attempt() -> None:
+    compressor = _compressor()
+    first = compressor.begin_request_calibration(100_000)
+    second = compressor.begin_request_calibration(200_000)
+
+    compressor.update_from_response(
+        {"prompt_tokens": 120_000}, calibration_attempt_id=second
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 60_000}, calibration_attempt_id=first
+    )
+
+    assert compressor.matched_request_rough_tokens == 200_000
+    assert compressor.matched_prompt_tokens == 120_000
+
+
+def test_two_compressors_sharing_session_reject_older_completion_last(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("shared", source="tui")
+    older = _compressor()
+    newer = _compressor()
+    older.bind_session_state(db, "shared")
+    newer.bind_session_state(db, "shared")
+
+    old_attempt = older.begin_request_calibration(100_000)
+    new_attempt = newer.begin_request_calibration(200_000)
+    newer.update_from_response(
+        {"prompt_tokens": 120_000}, calibration_attempt_id=new_attempt
+    )
+    older.update_from_response(
+        {"prompt_tokens": 60_000}, calibration_attempt_id=old_attempt
+    )
+
+    state = db.get_compaction_calibration("shared")
+    assert state is not None
+    assert state["rough_tokens"] == 200_000
+    assert state["prompt_tokens"] == 120_000
+    assert state["pair_sequence"] == new_attempt
+
+
+def test_effective_output_cap_is_attempt_identity_not_configured_default() -> None:
+    compressor = _compressor(max_tokens=16_384)
+    stable_shape = _shape()
+    compressor.set_request_calibration_shape(stable_shape, effective_output_cap=16_384)
+    normal = compressor.begin_request_calibration(
+        100_000,
+        prompt_tool_fingerprint=stable_shape,
+        effective_output_cap=16_384,
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 70_000}, calibration_attempt_id=normal
+    )
+
+    retry = compressor.begin_request_calibration(
+        101_000,
+        prompt_tool_fingerprint=stable_shape,
+        effective_output_cap=32_768,
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 71_000}, calibration_attempt_id=retry
+    )
+
+    compressor.set_request_calibration_shape(stable_shape, effective_output_cap=16_384)
+    assert compressor.calibrated_pressure_tokens(102_000) == 102_000
+
+
+def test_retry_output_cap_changes_effective_compaction_threshold() -> None:
+    compressor = _compressor(context_length=1_000_000, max_tokens=10_000)
+
+    assert compressor.should_compress_for_output_cap(600_000, 10_000) is False
+    assert compressor.should_compress_for_output_cap(600_000, 300_000) is True
+
+
+def test_prompt_or_tool_fingerprint_change_invalidates_pair_and_durable_row(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    compressor = _compressor()
+    compressor.bind_session_state(db, "session-a")
+    original = _shape("original")
+    changed = _shape("changed")
+    compressor.set_request_calibration_shape(original, effective_output_cap=16_384)
+    attempt = compressor.begin_request_calibration(
+        100_000,
+        prompt_tool_fingerprint=original,
+        effective_output_cap=16_384,
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 70_000}, calibration_attempt_id=attempt
+    )
+
+    compressor.set_request_calibration_shape(changed, effective_output_cap=16_384)
+
+    assert compressor.calibrated_pressure_tokens(101_000) == 101_000
+    assert db.get_compaction_calibration("session-a") is None
 
 
 def test_request_identity_changes_invalidate_pair() -> None:
@@ -139,6 +246,36 @@ def test_persisted_identity_never_contains_raw_base_url_credentials(tmp_path) ->
     assert state["identity"]["base_url_sha256"]
 
 
+def test_persisted_identity_contains_hashes_not_prompt_or_tool_contents(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    compressor = _compressor()
+    compressor.bind_session_state(db, "session-a")
+    fingerprint = request_prompt_tool_fingerprint(
+        {
+            "messages": [{"role": "system", "content": "TOP SECRET PROMPT"}],
+            "tools": [{"type": "function", "function": {"name": "secret_tool"}}],
+        }
+    )
+    compressor.set_request_calibration_shape(fingerprint, effective_output_cap=16_384)
+    attempt = compressor.begin_request_calibration(
+        100_000,
+        prompt_tool_fingerprint=fingerprint,
+        effective_output_cap=16_384,
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 70_000}, calibration_attempt_id=attempt
+    )
+
+    state = db.get_compaction_calibration("session-a")
+    assert state is not None
+    persisted = repr(state["identity"])
+    assert "TOP SECRET PROMPT" not in persisted
+    assert "secret_tool" not in persisted
+    assert state["identity"]["prompt_tool_sha256"] == fingerprint
+    assert state["identity"]["estimator_version"] > 0
+
+
 def test_compaction_boundary_clears_persisted_pair(tmp_path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("session-a", source="tui")
@@ -168,6 +305,25 @@ def test_matched_pair_round_trips_across_agent_rebuild_for_same_session(tmp_path
     assert rebuilt.calibrated_pressure_tokens(290_458) == 202_036
 
 
+def test_shaped_pair_survives_rebuild_until_prompt_tools_are_known(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("desktop-session", source="tui")
+    fingerprint = _shape("restored")
+    first = _compressor()
+    first.bind_session_state(db, "desktop-session")
+    first.set_request_calibration_shape(fingerprint, effective_output_cap=16_384)
+    attempt = first.begin_request_calibration(100_000)
+    first.update_from_response(
+        {"prompt_tokens": 70_000}, calibration_attempt_id=attempt
+    )
+
+    rebuilt = _compressor()
+    rebuilt.bind_session_state(db, "desktop-session")
+    assert db.get_compaction_calibration("desktop-session") is not None
+    rebuilt.set_request_calibration_shape(fingerprint, effective_output_cap=16_384)
+    assert rebuilt.calibrated_pressure_tokens(101_000) == 71_000
+
+
 def test_persisted_pair_is_bound_to_runtime_identity_and_session(tmp_path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("session-a", source="tui")
@@ -184,6 +340,19 @@ def test_persisted_pair_is_bound_to_runtime_identity_and_session(tmp_path) -> No
 
     assert wrong_model.calibrated_pressure_tokens(290_458) == 290_458
     assert other_session.calibrated_pressure_tokens(290_458) == 290_458
+
+
+def test_restore_identity_mismatch_clears_stale_row(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    first = _compressor()
+    first.bind_session_state(db, "session-a")
+    _record_success(first, rough_tokens=100_000, prompt_tokens=70_000)
+
+    mismatched = _compressor(model="gpt-5.6-mini")
+    mismatched.bind_session_state(db, "session-a")
+
+    assert db.get_compaction_calibration("session-a") is None
 
 
 def test_true_session_end_clears_persisted_pair(tmp_path) -> None:
@@ -213,6 +382,7 @@ def test_session_db_calibration_state_is_explicit_and_clearable(tmp_path) -> Non
 
     db.record_compaction_calibration(
         "session-a",
+        attempt_sequence=db.begin_compaction_calibration_attempt("session-a"),
         identity=identity,
         rough_tokens=290_282,
         prompt_tokens=201_860,
@@ -221,6 +391,7 @@ def test_session_db_calibration_state_is_explicit_and_clearable(tmp_path) -> Non
         "identity": identity,
         "rough_tokens": 290_282,
         "prompt_tokens": 201_860,
+        "pair_sequence": 1,
     }
 
     db.clear_compaction_calibration("session-a")
@@ -238,9 +409,10 @@ def test_existing_state_db_is_reconciled_before_calibration_round_trip(tmp_path)
         "compaction_calibration_identity",
         "compaction_calibration_rough_tokens",
         "compaction_calibration_prompt_tokens",
+        "compaction_calibration_attempt_sequence",
+        "compaction_calibration_pair_sequence",
     ):
         conn.execute(f"ALTER TABLE sessions DROP COLUMN {column}")
-    conn.execute("UPDATE schema_version SET version = 20")
     conn.commit()
     conn.close()
 
@@ -252,3 +424,41 @@ def test_existing_state_db_is_reconciled_before_calibration_round_trip(tmp_path)
     rebuilt = _compressor()
     rebuilt.bind_session_state(migrated, "legacy-session")
     assert rebuilt.calibrated_pressure_tokens(290_458) == 202_036
+
+
+def test_append_style_transcript_replacement_preserves_calibration(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    db.append_message("session-a", "user", "first")
+    compressor = _compressor()
+    compressor.bind_session_state(db, "session-a")
+    _record_success(compressor, rough_tokens=100_000, prompt_tokens=70_000)
+
+    db.replace_messages(
+        "session-a",
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+    )
+    assert db.get_compaction_calibration("session-a") is not None
+
+
+def test_structural_rewrite_and_rewind_clear_calibration(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    db.append_message("session-a", "user", "first")
+    db.append_message("session-a", "assistant", "answer")
+    compressor = _compressor()
+    compressor.bind_session_state(db, "session-a")
+    _record_success(compressor, rough_tokens=100_000, prompt_tokens=70_000)
+
+    db.replace_messages("session-a", [{"role": "user", "content": "retry"}])
+    assert db.get_compaction_calibration("session-a") is None
+
+    rebuilt = _compressor()
+    rebuilt.bind_session_state(db, "session-a")
+    _record_success(rebuilt, rough_tokens=110_000, prompt_tokens=75_000)
+    target = db.list_recent_user_messages("session-a", limit=1)[0]["id"]
+    db.rewind_to_message("session-a", target)
+    assert db.get_compaction_calibration("session-a") is None

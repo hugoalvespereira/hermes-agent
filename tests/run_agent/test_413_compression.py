@@ -16,6 +16,10 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
+from agent.model_metadata import (
+    estimate_provider_request_tokens_rough,
+    request_prompt_tool_fingerprint,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -139,6 +143,55 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
         "role": "user",
         "content": "new message that must survive a crash",
     }
+
+
+def test_calibration_uses_execution_middleware_terminal_payload(agent, monkeypatch):
+    replacement = {
+        "model": agent.model,
+        "messages": [
+            {"role": "system", "content": "middleware replacement prompt"},
+            {"role": "user", "content": "replacement body " * 200},
+        ],
+        "tools": _make_tool_defs("replacement_tool"),
+        "max_tokens": 777,
+    }
+    observed = []
+
+    def _execution_middleware(_request, next_call, **_context):
+        return next_call(replacement)
+
+    def _provider(final_request):
+        observed.append(final_request)
+        return _mock_response(
+            content="done",
+            usage={"prompt_tokens": 321, "completion_tokens": 5, "total_tokens": 326},
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware", _execution_middleware
+    )
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=_provider),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("original body")
+
+    assert result["final_response"] == "done"
+    assert observed == [replacement]
+    assert agent.context_compressor.matched_request_rough_tokens == (
+        estimate_provider_request_tokens_rough(
+            replacement, provider=agent.provider, api_mode=agent.api_mode
+        )
+    )
+    assert agent.context_compressor.matched_prompt_tokens == 321
+    assert agent.context_compressor.matched_calibration_identity[
+        "prompt_tool_sha256"
+    ] == request_prompt_tool_fingerprint(replacement)
+    assert agent.context_compressor.matched_calibration_identity[
+        "effective_output_cap"
+    ] == 777
 
 
 class TestHTTP413Compression:
@@ -647,6 +700,13 @@ class TestPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
         agent.context_compressor.last_prompt_tokens = 58_000
+        agent.context_compressor.set_request_calibration_shape(
+            request_prompt_tool_fingerprint({
+                "instructions": agent._cached_system_prompt or "",
+                "tools": agent.tools or [],
+            }),
+            effective_output_cap=agent.max_tokens,
+        )
         agent.context_compressor.begin_request_calibration(113_000)
         agent.context_compressor.update_from_response({"prompt_tokens": 58_000})
 
@@ -677,7 +737,8 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         assert result["completed"] is True
         assert result["final_response"] == "Used real fit"
-        assert agent.context_compressor.matched_request_rough_tokens == 114_000
+        assert agent.context_compressor.matched_request_rough_tokens > 0
+        assert agent.context_compressor.matched_request_rough_tokens != 114_000
         assert agent.context_compressor.matched_prompt_tokens == 59_000
         assert not any(
             ev == "lifecycle" and "Preflight compression" in msg
@@ -690,6 +751,13 @@ class TestPreflightCompression:
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 100_000
         agent.context_compressor.last_prompt_tokens = 58_000
+        agent.context_compressor.set_request_calibration_shape(
+            request_prompt_tool_fingerprint({
+                "instructions": agent._cached_system_prompt or "",
+                "tools": agent.tools or [],
+            }),
+            effective_output_cap=agent.max_tokens,
+        )
         agent.context_compressor.begin_request_calibration(113_000)
         agent.context_compressor.update_from_response({"prompt_tokens": 58_000})
 

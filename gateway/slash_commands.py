@@ -2166,6 +2166,12 @@ class GatewaySlashCommandsMixin:
         await self.async_session_store.rewrite_transcript(session_entry.session_id, truncated)
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
+        try:
+            evict_cached_agent = getattr(self, "_evict_cached_agent", None)
+            if callable(evict_cached_agent):
+                evict_cached_agent(session_entry.session_key)
+        except Exception as e:
+            logger.debug("retry: cached-agent eviction skipped: %s", e)
 
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(

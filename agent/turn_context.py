@@ -33,6 +33,7 @@ from agent.iteration_budget import IterationBudget
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    request_prompt_tool_fingerprint,
 )
 
 logger = logging.getLogger(__name__)
@@ -379,6 +380,21 @@ def build_turn_context(
             api_mode=agent.api_mode or "",
         )
         _compressor = agent.context_compressor
+        _set_calibration_shape = getattr(
+            _compressor, "set_request_calibration_shape", None
+        )
+        _preflight_output_cap = (
+            getattr(agent, "_ephemeral_max_output_tokens", None)
+            or agent.max_tokens
+        )
+        if callable(_set_calibration_shape):
+            _set_calibration_shape(
+                request_prompt_tool_fingerprint({
+                    "instructions": active_system_prompt or "",
+                    "tools": agent.tools or [],
+                }),
+                effective_output_cap=_preflight_output_cap,
+            )
         _calibrated_pressure = getattr(
             _compressor,
             "calibrated_pressure_tokens",
@@ -434,7 +450,11 @@ def build_turn_context(
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_preflight_pressure):
+        elif getattr(
+            _compressor,
+            "should_compress_for_output_cap",
+            lambda tokens, _cap: _compressor.should_compress(tokens),
+        )(_preflight_pressure, _preflight_output_cap):
             logger.info(
                 "Preflight compression: calibrated pressure ~%s tokens "
                 "(rough ~%s) >= %s threshold (model %s, ctx %s)",
@@ -484,7 +504,11 @@ def build_turn_context(
                 _preflight_pressure = _calibrated_pressure(_preflight_tokens)
                 if (
                     _preflight_pressure is None
-                    or not _compressor.should_compress(_preflight_pressure)
+                    or not getattr(
+                        _compressor,
+                        "should_compress_for_output_cap",
+                        lambda tokens, _cap: _compressor.should_compress(tokens),
+                    )(_preflight_pressure, _preflight_output_cap)
                 ):
                     break
 

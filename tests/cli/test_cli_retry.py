@@ -1,5 +1,8 @@
 """Regression tests for CLI /retry history replacement semantics."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 from tests.cli.test_cli_init import _make_cli
 
 
@@ -47,3 +50,27 @@ def test_process_command_retry_requeues_original_message_not_retry_command():
 
     assert queued == ["retry me"]
     assert cli.conversation_history == []
+
+
+def test_cli_retry_and_undo_invalidate_in_memory_calibration():
+    cli = _make_cli()
+    invalidate = MagicMock()
+    cli.agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            invalidate_matched_calibration=invalidate,
+        )
+    )
+    cli.conversation_history = [
+        {"role": "user", "content": "retry me"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    assert cli.retry_last() == "retry me"
+    invalidate.assert_called_once_with()
+
+    cli.conversation_history = [
+        {"role": "user", "content": "undo me"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    cli.undo_last(prefill=False)
+    assert invalidate.call_count == 2

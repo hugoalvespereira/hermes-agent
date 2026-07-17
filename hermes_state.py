@@ -761,6 +761,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     compaction_calibration_identity TEXT,
     compaction_calibration_rough_tokens INTEGER,
     compaction_calibration_prompt_tokens INTEGER,
+    compaction_calibration_attempt_sequence INTEGER NOT NULL DEFAULT 0,
+    compaction_calibration_pair_sequence INTEGER,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -2276,6 +2278,25 @@ class SessionDB:
                 session_id, exc,
             )
 
+    def begin_compaction_calibration_attempt(self, session_id: str) -> int:
+        """Atomically allocate a session-global monotonic calibration sequence."""
+        if not session_id:
+            return 0
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compaction_calibration_attempt_sequence = "
+                "COALESCE(compaction_calibration_attempt_sequence, 0) + 1 WHERE id = ?",
+                (session_id,),
+            )
+            row = conn.execute(
+                "SELECT compaction_calibration_attempt_sequence FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            return int(row[0]) if row is not None else 0
+
+        return self._execute_write(_do)
+
     def record_compaction_calibration(
         self,
         session_id: str,
@@ -2283,10 +2304,18 @@ class SessionDB:
         identity: Dict[str, Any],
         rough_tokens: int,
         prompt_tokens: int,
-    ) -> None:
-        """Persist one matched rough/provider prompt-token pair for a session."""
-        if not session_id or rough_tokens <= 0 or prompt_tokens <= 0:
-            return
+        attempt_sequence: Optional[int] = None,
+    ) -> bool:
+        """CAS-persist a pair only when its attempt is still session-newest."""
+        if attempt_sequence is None:
+            attempt_sequence = self.begin_compaction_calibration_attempt(session_id)
+        if (
+            not session_id
+            or attempt_sequence <= 0
+            or rough_tokens <= 0
+            or prompt_tokens <= 0
+        ):
+            return False
         identity_json = json.dumps(
             identity,
             ensure_ascii=False,
@@ -2295,14 +2324,24 @@ class SessionDB:
         )
 
         def _do(conn):
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE sessions SET compaction_calibration_identity = ?, "
                 "compaction_calibration_rough_tokens = ?, "
-                "compaction_calibration_prompt_tokens = ? WHERE id = ?",
-                (identity_json, int(rough_tokens), int(prompt_tokens), session_id),
+                "compaction_calibration_prompt_tokens = ?, "
+                "compaction_calibration_pair_sequence = ? "
+                "WHERE id = ? AND compaction_calibration_attempt_sequence = ?",
+                (
+                    identity_json,
+                    int(rough_tokens),
+                    int(prompt_tokens),
+                    int(attempt_sequence),
+                    session_id,
+                    int(attempt_sequence),
+                ),
             )
+            return cursor.rowcount == 1
 
-        self._execute_write(_do)
+        return self._execute_write(_do)
 
     def get_compaction_calibration(
         self,
@@ -2315,7 +2354,8 @@ class SessionDB:
             row = self._conn.execute(
                 "SELECT compaction_calibration_identity, "
                 "compaction_calibration_rough_tokens, "
-                "compaction_calibration_prompt_tokens "
+                "compaction_calibration_prompt_tokens, "
+                "compaction_calibration_pair_sequence "
                 "FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
@@ -2325,14 +2365,21 @@ class SessionDB:
             identity = json.loads(row["compaction_calibration_identity"] or "")
             rough_tokens = int(row["compaction_calibration_rough_tokens"] or 0)
             prompt_tokens = int(row["compaction_calibration_prompt_tokens"] or 0)
+            pair_sequence = int(row["compaction_calibration_pair_sequence"] or 0)
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
-        if not isinstance(identity, dict) or rough_tokens <= 0 or prompt_tokens <= 0:
+        if (
+            not isinstance(identity, dict)
+            or rough_tokens <= 0
+            or prompt_tokens <= 0
+            or pair_sequence <= 0
+        ):
             return None
         return {
             "identity": identity,
             "rough_tokens": rough_tokens,
             "prompt_tokens": prompt_tokens,
+            "pair_sequence": pair_sequence,
         }
 
     def clear_compaction_calibration(self, session_id: str) -> None:
@@ -2344,7 +2391,10 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET compaction_calibration_identity = NULL, "
                 "compaction_calibration_rough_tokens = NULL, "
-                "compaction_calibration_prompt_tokens = NULL WHERE id = ?",
+                "compaction_calibration_prompt_tokens = NULL, "
+                "compaction_calibration_pair_sequence = NULL, "
+                "compaction_calibration_attempt_sequence = "
+                "COALESCE(compaction_calibration_attempt_sequence, 0) + 1 WHERE id = ?",
                 (session_id,),
             )
 
@@ -3989,6 +4039,10 @@ class SessionDB:
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            old_active_count = int(conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()[0])
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -4000,10 +4054,22 @@ class SessionDB:
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, session_id, messages
             )
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, session_id),
-            )
+            if total_messages < old_active_count:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "compaction_calibration_identity = NULL, "
+                    "compaction_calibration_rough_tokens = NULL, "
+                    "compaction_calibration_prompt_tokens = NULL, "
+                    "compaction_calibration_pair_sequence = NULL, "
+                    "compaction_calibration_attempt_sequence = "
+                    "COALESCE(compaction_calibration_attempt_sequence, 0) + 1 WHERE id = ?",
+                    (total_messages, total_tool_calls, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    (total_messages, total_tool_calls, session_id),
+                )
 
         self._execute_write(_do)
 
@@ -4627,7 +4693,13 @@ class SessionDB:
                     ids,
                 )
             conn.execute(
-                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
+                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1, "
+                "compaction_calibration_identity = NULL, "
+                "compaction_calibration_rough_tokens = NULL, "
+                "compaction_calibration_prompt_tokens = NULL, "
+                "compaction_calibration_pair_sequence = NULL, "
+                "compaction_calibration_attempt_sequence = "
+                "COALESCE(compaction_calibration_attempt_sequence, 0) + 1 "
                 "WHERE id = ?",
                 (session_id,),
             )

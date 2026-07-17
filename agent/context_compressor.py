@@ -21,6 +21,7 @@ import json
 import logging
 import sqlite3
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -28,12 +29,15 @@ from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    REQUEST_TOKEN_ESTIMATOR_VERSION,
     get_model_context_length,
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+_CALIBRATION_UNSET = object()
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
@@ -789,6 +793,9 @@ class ContextCompressor(ContextEngine):
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind durable cooldown and matched-token state for this session."""
         self._clear_matched_calibration(persist=False)
+        self._current_prompt_tool_fingerprint = ""
+        self._current_effective_output_cap = self.max_tokens
+        self._local_calibration_sequence = 0
         self.last_prompt_tokens = 0
         self.last_real_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
@@ -808,7 +815,18 @@ class ContextCompressor(ContextEngine):
         except Exception:
             logger.debug("compaction calibration restore failed", exc_info=True)
             return
-        if not state or state.get("identity") != self._calibration_identity():
+        if not state:
+            return
+        persisted_identity = state.get("identity")
+        current_identity = self._calibration_identity()
+        if not isinstance(persisted_identity, dict) or any(
+            persisted_identity.get(key) != value
+            for key, value in current_identity.items()
+            if key != "prompt_tool_sha256"
+        ):
+            # A stale durable row must not survive an identity mismatch and
+            # resurrect if a later route/prompt happens to match it again.
+            self._clear_matched_calibration(persist=True)
             return
         rough_tokens = int(state.get("rough_tokens") or 0)
         prompt_tokens = int(state.get("prompt_tokens") or 0)
@@ -816,6 +834,7 @@ class ContextCompressor(ContextEngine):
             self.matched_request_rough_tokens = rough_tokens
             self.matched_prompt_tokens = prompt_tokens
             self.matched_calibration_identity = dict(state["identity"])
+            self.matched_calibration_sequence = int(state.get("pair_sequence") or 0)
             self.last_real_prompt_tokens = prompt_tokens
             self.last_prompt_tokens = prompt_tokens
 
@@ -944,6 +963,7 @@ class ContextCompressor(ContextEngine):
         # passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
+        self._current_effective_output_cap = self.max_tokens
         self.threshold_tokens = self._compute_threshold_tokens(
             context_length, self.threshold_percent, self.max_tokens,
         )
@@ -1175,8 +1195,12 @@ class ContextCompressor(ContextEngine):
         self.matched_request_rough_tokens = 0
         self.matched_prompt_tokens = 0
         self.matched_calibration_identity: Optional[Dict[str, Any]] = None
-        self._pending_request_rough_tokens = 0
-        self._pending_calibration_identity: Optional[Dict[str, Any]] = None
+        self.matched_calibration_sequence = 0
+        self._calibration_lock = threading.RLock()
+        self._pending_calibration_attempts: Dict[int, tuple[int, Dict[str, Any]]] = {}
+        self._local_calibration_sequence = 0
+        self._current_prompt_tool_fingerprint = ""
+        self._current_effective_output_cap = self.max_tokens
 
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
@@ -1229,7 +1253,12 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
-    def _calibration_identity(self) -> Dict[str, Any]:
+    def _calibration_identity(
+        self,
+        *,
+        prompt_tool_fingerprint: Optional[str] = None,
+        effective_output_cap: Any = _CALIBRATION_UNSET,
+    ) -> Dict[str, Any]:
         """Return the runtime identity to which a matched pair is bound."""
         base_url = str(getattr(self, "base_url", "") or "")
         return {
@@ -1242,84 +1271,180 @@ class ContextCompressor(ContextEngine):
             else "",
             "api_mode": str(getattr(self, "api_mode", "") or ""),
             "context_length": int(getattr(self, "context_length", 0) or 0),
-            "max_tokens": getattr(self, "max_tokens", None),
+            "effective_output_cap": self._coerce_max_tokens(
+                self._current_effective_output_cap
+                if effective_output_cap is _CALIBRATION_UNSET
+                else effective_output_cap
+            ),
+            "estimator_version": REQUEST_TOKEN_ESTIMATOR_VERSION,
+            "prompt_tool_sha256": (
+                self._current_prompt_tool_fingerprint
+                if prompt_tool_fingerprint is None
+                else str(prompt_tool_fingerprint or "")
+            ),
         }
+
+    def set_request_calibration_shape(
+        self,
+        prompt_tool_fingerprint: str,
+        *,
+        effective_output_cap: Any = _CALIBRATION_UNSET,
+    ) -> None:
+        """Set the current stable request shape and invalidate an incompatible pair."""
+        with self._calibration_lock:
+            self._current_prompt_tool_fingerprint = str(prompt_tool_fingerprint or "")
+            if effective_output_cap is not _CALIBRATION_UNSET:
+                self._current_effective_output_cap = self._coerce_max_tokens(
+                    effective_output_cap
+                )
+            if (
+                self.matched_calibration_identity is not None
+                and self.matched_calibration_identity != self._calibration_identity()
+            ):
+                self._clear_matched_calibration(persist=True)
 
     def _clear_matched_calibration(self, *, persist: bool) -> None:
         """Clear in-memory calibration and optionally its bound session row."""
-        self.matched_request_rough_tokens = 0
-        self.matched_prompt_tokens = 0
-        self.matched_calibration_identity = None
-        self.discard_request_calibration()
-        if not persist:
-            return
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "_session_id", "")
-        clearer = getattr(session_db, "clear_compaction_calibration", None)
-        if clearer is None or not session_id:
-            return
-        try:
-            clearer(session_id)
-        except Exception:
-            logger.debug("compaction calibration clear failed", exc_info=True)
+        with self._calibration_lock:
+            self.matched_request_rough_tokens = 0
+            self.matched_prompt_tokens = 0
+            self.matched_calibration_identity = None
+            self.matched_calibration_sequence = 0
+            self.discard_request_calibration()
+            if not persist:
+                return
+            session_db = getattr(self, "_session_db", None)
+            session_id = getattr(self, "_session_id", "")
+            clearer = getattr(session_db, "clear_compaction_calibration", None)
+            if clearer is None or not session_id:
+                return
+            try:
+                clearer(session_id)
+            except Exception:
+                logger.debug("compaction calibration clear failed", exc_info=True)
 
     def invalidate_matched_calibration(self) -> None:
         """Discard a matched pair after a real compaction boundary."""
         self._clear_matched_calibration(persist=True)
 
-    def begin_request_calibration(self, rough_tokens: int) -> None:
-        """Capture the rough estimate for the request about to be sent."""
-        self.discard_request_calibration()
+    def begin_request_calibration(
+        self,
+        rough_tokens: int,
+        *,
+        prompt_tool_fingerprint: Optional[str] = None,
+        effective_output_cap: Any = _CALIBRATION_UNSET,
+    ) -> Optional[int]:
+        """Capture an immutable attempt snapshot for the request about to be sent."""
         try:
             rough_tokens = int(rough_tokens)
         except (TypeError, ValueError):
-            return
+            return None
         if rough_tokens <= 0:
-            return
-        self._pending_request_rough_tokens = rough_tokens
-        self._pending_calibration_identity = self._calibration_identity()
+            return None
+        fingerprint = (
+            self._current_prompt_tool_fingerprint
+            if prompt_tool_fingerprint is None
+            else str(prompt_tool_fingerprint or "")
+        )
+        cap = (
+            self._current_effective_output_cap
+            if effective_output_cap is _CALIBRATION_UNSET
+            else self._coerce_max_tokens(effective_output_cap)
+        )
+        self.set_request_calibration_shape(fingerprint, effective_output_cap=cap)
+        identity = self._calibration_identity()
+        allocator = getattr(
+            getattr(self, "_session_db", None),
+            "begin_compaction_calibration_attempt",
+            None,
+        )
+        attempt_id = 0
+        if callable(allocator) and getattr(self, "_session_id", ""):
+            try:
+                allocated = allocator(self._session_id)
+                attempt_id = int(allocated) if isinstance(allocated, int) else 0
+            except Exception:
+                logger.debug("compaction calibration sequence allocation failed", exc_info=True)
+        with self._calibration_lock:
+            if attempt_id <= 0:
+                self._local_calibration_sequence += 1
+                attempt_id = self._local_calibration_sequence
+            self._pending_calibration_attempts[attempt_id] = (rough_tokens, identity)
+        return attempt_id
 
-    def discard_request_calibration(self) -> None:
+    def discard_request_calibration(self, attempt_id: Optional[int] = None) -> None:
         """Drop an unpaired estimate after a failed or abandoned request."""
-        self._pending_request_rough_tokens = 0
-        self._pending_calibration_identity = None
+        with self._calibration_lock:
+            if attempt_id is None:
+                self._pending_calibration_attempts.clear()
+            else:
+                self._pending_calibration_attempts.pop(attempt_id, None)
 
-    def _persist_matched_calibration(self) -> None:
+    def _persist_matched_calibration(
+        self,
+        *,
+        attempt_sequence: int,
+        identity: Dict[str, Any],
+        rough_tokens: int,
+        prompt_tokens: int,
+    ) -> bool:
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         recorder = getattr(session_db, "record_compaction_calibration", None)
-        if recorder is None or not session_id or self.matched_calibration_identity is None:
-            return
+        if recorder is None or not session_id:
+            return True
         try:
-            recorder(
+            return bool(recorder(
                 session_id,
-                identity=self.matched_calibration_identity,
-                rough_tokens=self.matched_request_rough_tokens,
-                prompt_tokens=self.matched_prompt_tokens,
-            )
+                attempt_sequence=attempt_sequence,
+                identity=identity,
+                rough_tokens=rough_tokens,
+                prompt_tokens=prompt_tokens,
+            ))
         except Exception:
             logger.debug("compaction calibration persist failed", exc_info=True)
+            return False
 
-    def update_from_response(self, usage: Dict[str, Any]):
+    def update_from_response(
+        self,
+        usage: Dict[str, Any],
+        *,
+        calibration_attempt_id: Optional[int] = None,
+    ):
         """Update tracked token usage from API response."""
-        pending_rough_tokens = self._pending_request_rough_tokens
-        pending_identity = self._pending_calibration_identity
-        self.discard_request_calibration()
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        with self._calibration_lock:
+            if calibration_attempt_id is None and len(self._pending_calibration_attempts) == 1:
+                calibration_attempt_id = next(iter(self._pending_calibration_attempts))
+            pending = (
+                self._pending_calibration_attempts.pop(calibration_attempt_id, None)
+                if calibration_attempt_id is not None
+                else None
+            )
+        pending_rough_tokens, pending_identity = pending or (0, None)
+        response_prompt_tokens = usage.get("prompt_tokens", 0)
+        self.last_prompt_tokens = response_prompt_tokens
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
-        if self.last_prompt_tokens > 0:
-            self.last_real_prompt_tokens = self.last_prompt_tokens
-            if (
-                pending_rough_tokens > 0
-                and pending_identity is not None
-                and pending_identity == self._calibration_identity()
-            ):
-                self.matched_request_rough_tokens = pending_rough_tokens
-                self.matched_prompt_tokens = self.last_prompt_tokens
-                self.matched_calibration_identity = dict(pending_identity)
-                self._persist_matched_calibration()
-            if self.last_prompt_tokens < self.threshold_tokens:
+        if response_prompt_tokens > 0:
+            self.last_real_prompt_tokens = response_prompt_tokens
+            if pending_rough_tokens > 0 and pending_identity is not None:
+                attempt_sequence = int(calibration_attempt_id or 0)
+                with self._calibration_lock:
+                    if (
+                        attempt_sequence >= self.matched_calibration_sequence
+                        and pending_identity == self._calibration_identity()
+                        and self._persist_matched_calibration(
+                            attempt_sequence=attempt_sequence,
+                            identity=pending_identity,
+                            rough_tokens=pending_rough_tokens,
+                            prompt_tokens=response_prompt_tokens,
+                        )
+                    ):
+                        self.matched_request_rough_tokens = pending_rough_tokens
+                        self.matched_prompt_tokens = response_prompt_tokens
+                        self.matched_calibration_identity = dict(pending_identity)
+                        self.matched_calibration_sequence = attempt_sequence
+            if response_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
                     self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
                 # Any real provider reading below the trigger proves the prompt
@@ -1346,7 +1471,7 @@ class ContextCompressor(ContextEngine):
             # Keying on real usage compares like with like and fires exactly once
             # per compaction.
             if self._verify_compaction_cleared_threshold:
-                if self.last_prompt_tokens >= self.threshold_tokens:
+                if response_prompt_tokens >= self.threshold_tokens:
                     self._ineffective_compression_count += 1
                     if not self.quiet_mode:
                         logger.warning(
@@ -1355,7 +1480,7 @@ class ContextCompressor(ContextEngine):
                             "(system prompt + tool schemas) may already exceed "
                             "it, in which case shrinking messages cannot help. "
                             "ineffective_compression_count=%d",
-                            self.last_prompt_tokens, self.threshold_tokens,
+                            response_prompt_tokens, self.threshold_tokens,
                             self._ineffective_compression_count,
                         )
                 else:
@@ -1374,16 +1499,17 @@ class ContextCompressor(ContextEngine):
         overhead cannot trigger compaction while genuinely new tool output can.
         ``None`` retains the one-call post-compaction deferral sentinel.
         """
-        if self.awaiting_real_usage_after_compression:
-            return None
-        if (
-            self.matched_request_rough_tokens <= 0
-            or self.matched_prompt_tokens <= 0
-            or self.matched_calibration_identity != self._calibration_identity()
-        ):
-            return rough_tokens
-        growth = max(0, rough_tokens - self.matched_request_rough_tokens)
-        return self.matched_prompt_tokens + growth
+        with self._calibration_lock:
+            if self.awaiting_real_usage_after_compression:
+                return None
+            if (
+                self.matched_request_rough_tokens <= 0
+                or self.matched_prompt_tokens <= 0
+                or self.matched_calibration_identity != self._calibration_identity()
+            ):
+                return rough_tokens
+            growth = max(0, rough_tokens - self.matched_request_rough_tokens)
+            return self.matched_prompt_tokens + growth
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Backward-compatible Boolean view of calibrated request pressure."""
@@ -1430,6 +1556,24 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         return True
+
+    def should_compress_for_output_cap(
+        self, prompt_tokens: int, effective_output_cap: Any
+    ) -> bool:
+        """Apply the normal guards using the final request's output reserve."""
+        normalized_cap = self._coerce_max_tokens(effective_output_cap)
+        if normalized_cap == self.max_tokens:
+            return self.should_compress(prompt_tokens)
+        request_threshold = self._compute_threshold_tokens(
+            self.context_length,
+            self.threshold_percent,
+            normalized_cap,
+        )
+        if prompt_tokens < request_threshold:
+            return False
+        # Reuse cooldown/anti-thrash behavior without allowing the configured
+        # threshold to mask a lower threshold caused by a retry's larger cap.
+        return self.should_compress(max(prompt_tokens, self.threshold_tokens))
 
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)

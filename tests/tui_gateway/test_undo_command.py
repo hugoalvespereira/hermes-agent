@@ -168,6 +168,19 @@ def test_undo_notifies_memory_provider(server, session_with_history):
     assert kwargs["reset"] is False
 
 
+def test_undo_invalidates_live_compaction_calibration(server, session_with_history):
+    sid, _, _, agent = session_with_history
+    _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
+    agent.context_compressor.invalidate_matched_calibration.assert_called_once_with()
+
+
+def test_retry_invalidates_live_compaction_calibration(server, session_with_history):
+    sid, _, _, agent = session_with_history
+    response = _call(server, "command.dispatch", session_id=sid, name="retry", arg="")
+    assert response["result"]["type"] == "send"
+    agent.context_compressor.invalidate_matched_calibration.assert_called_once_with()
+
+
 def test_undo_refuses_when_session_busy(server, session_with_history):
     sid, _, s, _ = session_with_history
     s["running"] = True

@@ -75,6 +75,7 @@ async def test_gateway_retry_replays_original_text_not_retry_command(tmp_path):
     gw = GatewayRunner.__new__(GatewayRunner)
     gw.config = config
     gw.session_store = MagicMock()
+    gw._evict_cached_agent = MagicMock()
 
     session_entry = MagicMock(session_id="test-session")
     session_entry.last_prompt_tokens = 55
@@ -98,3 +99,4 @@ async def test_gateway_retry_replays_original_text_not_retry_command(tmp_path):
     )
 
     assert captured["text"] == "real message"
+    gw._evict_cached_agent.assert_called_once()

@@ -12118,6 +12118,13 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["history"] = history[:last_user_idx]
             session["history_version"] = int(session.get("history_version", 0)) + 1
+        retry_agent = session.get("agent")
+        retry_compressor = getattr(retry_agent, "context_compressor", None)
+        retry_invalidate = getattr(
+            retry_compressor, "invalidate_matched_calibration", None
+        )
+        if callable(retry_invalidate):
+            retry_invalidate()
         return _ok(rid, {"type": "send", "message": content})
 
     if name == "steer":
@@ -12269,6 +12276,10 @@ def _(rid, params: dict) -> dict:
         # know to invalidate. See #6672 + #21910.
         agent = session.get("agent")
         if agent is not None:
+            compressor = getattr(agent, "context_compressor", None)
+            invalidate = getattr(compressor, "invalidate_matched_calibration", None)
+            if callable(invalidate):
+                invalidate()
             mm = getattr(agent, "_memory_manager", None)
             if mm is not None:
                 try:
