@@ -100,7 +100,7 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when effective input pressure ≥ `(context_length - max_output_tokens) × threshold` |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
@@ -155,25 +155,42 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Computed Values (for a 200K context model at defaults)
+### Computed Values (372K context, 16,384 max output, 90% threshold)
 
 ```
-context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
-max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
+context_length       = 372,000
+output_reserve       = 16,384
+usable_input_budget  = 372,000 - 16,384 = 355,616
+threshold_tokens     = 355,616 × 0.90 = 320,054
+tail_token_budget    = 320,054 × 0.20 = 64,010
+max_summary_tokens   = min(372,000 × 0.05, 12,000) = 12,000
 ```
 
-:::note Threshold is derived from the MAIN model's context window
-`threshold_tokens` is always `threshold × context_length`, where `context_length`
-is the **main agent model's** context window — never the auxiliary/summary
-model's. On a 262,144-token model at the default `0.50`, the threshold is
-`262,144 × 0.50 = 131,072`. That number being close to a common "128K context"
-is a coincidence of the percentage, not a sign that the auxiliary model's window
-is the trigger. The auxiliary model's context window is a separate concern — see
-the "Summary model context length" warning below for how it affects whether a
-summary can be produced, not when compression fires.
+:::note Threshold is derived from the MAIN model's usable input budget
+`threshold_tokens` is `(context_length - max_output_tokens) × threshold`, where
+both limits come from the **main agent model**. The output reservation keeps
+room for the response; it is not available for input. The auxiliary model's
+context window is a separate concern — see the "Summary model context length"
+warning below for how it affects whether a summary can be produced, not when
+compression fires.
 :::
+
+### Provider-calibrated pressure
+
+A rough estimate is still required before the first provider response. After a
+successful request reports real prompt usage, Hermes stores that real count
+with the rough estimate for the same outgoing request. The next decision uses:
+
+```
+effective_pressure = previous_real_prompt + max(0, current_rough - previous_rough)
+```
+
+This keeps the provider's token count as the baseline while still reacting to
+new messages and large tool results. The pair is scoped to the model, provider,
+base URL, API mode, context length, and output budget; it is persisted with the
+session and discarded after compaction or a route change. Codex Responses
+requests are estimated from their normalized provider input rather than the
+larger internal transcript representation.
 
 
 ## Compression Algorithm

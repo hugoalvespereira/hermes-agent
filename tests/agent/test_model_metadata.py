@@ -187,6 +187,24 @@ class TestEstimateRequestTokensRough:
             api_mode="codex_responses",
         )
 
+    def test_codex_estimator_counts_embedded_system_message_as_instructions(self):
+        system = "system instructions " * 100
+        user = {"role": "user", "content": "hello"}
+
+        embedded = estimate_request_tokens_rough(
+            [{"role": "system", "content": system}, user],
+            provider="openai-codex",
+            api_mode="codex_responses",
+        )
+        explicit = estimate_request_tokens_rough(
+            [user],
+            system_prompt=system,
+            provider="openai-codex",
+            api_mode="codex_responses",
+        )
+
+        assert embedded == explicit
+
     def test_non_codex_estimator_keeps_existing_internal_shape(self):
         messages = [{"role": "assistant", "content": "ok", "reasoning": "r" * 400}]
         baseline = estimate_request_tokens_rough(messages, system_prompt="system")

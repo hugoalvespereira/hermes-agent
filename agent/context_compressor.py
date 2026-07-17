@@ -1141,14 +1141,24 @@ class ContextCompressor(ContextEngine):
         )
 
         if not quiet_mode:
+            output_reserve = int(self.max_tokens or 0)
+            usable_input_budget = max(1, self.context_length - output_reserve)
             logger.info(
                 "Context compressor initialized: model=%s context_length=%d "
-                "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
-                "provider=%s base_url=%s",
-                model, self.context_length, self.threshold_tokens,
-                threshold_percent * 100, self.summary_target_ratio * 100,
+                "output_reserve=%d usable_input_budget=%d threshold=%d "
+                "(%.0f%% of usable input) target_ratio=%.0f%% tail_budget=%d "
+                "provider=%s api_mode=%s custom_base_url=%s",
+                model,
+                self.context_length,
+                output_reserve,
+                usable_input_budget,
+                self.threshold_tokens,
+                threshold_percent * 100,
+                self.summary_target_ratio * 100,
                 self.tail_token_budget,
-                provider or "none", base_url or "none",
+                provider or "none",
+                api_mode or "none",
+                bool(base_url),
             )
         self._context_probed = False  # True after a step-down from context error
 
@@ -1221,9 +1231,16 @@ class ContextCompressor(ContextEngine):
 
     def _calibration_identity(self) -> Dict[str, Any]:
         """Return the runtime identity to which a matched pair is bound."""
+        base_url = str(getattr(self, "base_url", "") or "")
         return {
             "model": str(getattr(self, "model", "") or ""),
             "provider": str(getattr(self, "provider", "") or ""),
+            # Custom URLs can contain embedded credentials. Persist only a
+            # route fingerprint, never the URL itself.
+            "base_url_sha256": hashlib.sha256(base_url.encode()).hexdigest()
+            if base_url
+            else "",
+            "api_mode": str(getattr(self, "api_mode", "") or ""),
             "context_length": int(getattr(self, "context_length", 0) or 0),
             "max_tokens": getattr(self, "max_tokens", None),
         }
@@ -1245,6 +1262,10 @@ class ContextCompressor(ContextEngine):
             clearer(session_id)
         except Exception:
             logger.debug("compaction calibration clear failed", exc_info=True)
+
+    def invalidate_matched_calibration(self) -> None:
+        """Discard a matched pair after a real compaction boundary."""
+        self._clear_matched_calibration(persist=True)
 
     def begin_request_calibration(self, rough_tokens: int) -> None:
         """Capture the rough estimate for the request about to be sent."""

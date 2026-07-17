@@ -32,12 +32,18 @@ class DummyAgent:
         self.platform = "cli"
         self._cached_system_prompt = "cached prompt"
         self._codex_session = FakeCodexSession(result)
+        self.calibration_invalidations = 0
+
+        def invalidate_calibration():
+            self.calibration_invalidations += 1
+
         self.context_compressor = SimpleNamespace(
             compression_count=0,
             last_compression_rough_tokens=0,
             last_prompt_tokens=123,
             last_completion_tokens=45,
             awaiting_real_usage_after_compression=False,
+            invalidate_matched_calibration=invalidate_calibration,
         )
         self.statuses = []
         self.warnings = []
@@ -101,6 +107,7 @@ def test_codex_app_server_manual_compression_routes_to_codex_thread():
     assert prompt == "cached prompt"
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 1
+    assert agent.calibration_invalidations == 1
     assert agent.context_compressor.last_compression_rough_tokens == 100000
     # This minimal fake compressor does not implement update_from_response(),
     # so the runtime preserves its existing pending-usage bookkeeping here.
@@ -142,6 +149,7 @@ def test_codex_app_server_hermes_mode_auto_compression_routes_to_codex_thread():
     assert prompt == "cached prompt"
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 1
+    assert agent.calibration_invalidations == 1
 
 
 def test_codex_app_server_compression_failure_preserves_bookkeeping():
@@ -160,6 +168,7 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert prompt == "cached prompt"
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 0
+    assert agent.calibration_invalidations == 0
     assert agent.context_compressor.last_prompt_tokens == 123
     assert agent.warnings
 
@@ -178,6 +187,7 @@ def test_codex_app_server_native_compaction_notice_emits_status_and_event():
 
     assert recorded is True
     assert agent.context_compressor.compression_count == 1
+    assert agent.calibration_invalidations == 1
     assert agent.statuses == [COMPACTION_STATUS]
     assert agent.events == [
         (

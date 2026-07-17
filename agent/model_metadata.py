@@ -2580,8 +2580,23 @@ def estimate_request_tokens_rough(
         try:
             from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
+            payload_messages = messages or []
+            # ResponsesApiTransport extracts the first system message into the
+            # separate ``instructions`` field. The normalized input converter
+            # intentionally skips system rows, so account for that instruction
+            # here when the caller did not pass it separately.
+            if (
+                not system_prompt
+                and payload_messages
+                and payload_messages[0].get("role") == "system"
+            ):
+                total += (
+                    len(str(payload_messages[0].get("content") or "")) + 3
+                ) // 4
+                payload_messages = payload_messages[1:]
+
             normalized_messages = _chat_messages_to_responses_input(
-                messages or [],
+                payload_messages,
                 current_issuer_kind="openai_codex",
             )
             if normalized_messages:

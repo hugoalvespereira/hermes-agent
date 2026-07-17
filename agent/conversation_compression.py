@@ -970,7 +970,14 @@ def compress_context(
             compressed,
             system_prompt=new_system_prompt or "",
             tools=agent.tools or None,
+            provider=agent.provider or "",
+            api_mode=agent.api_mode or "",
         )
+        invalidate_calibration = getattr(
+            agent.context_compressor, "invalidate_matched_calibration", None
+        )
+        if callable(invalidate_calibration):
+            invalidate_calibration()
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0

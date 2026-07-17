@@ -965,8 +965,12 @@ def run_conversation(
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages,
+            tools=agent.tools or None,
+            provider=agent.provider or "",
+            api_mode=agent.api_mode or "",
         )
+        request_pressure_route = (agent.provider or "", agent.api_mode or "")
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -1029,8 +1033,10 @@ def run_conversation(
                 compression_attempts,
             )
             agent._emit_status(
-                f"📦 Pre-API compression: ~{request_pressure_tokens:,} tokens "
-                f"near the context/output limit. Compacting before the next model call."
+                f"📦 Pre-API compression: effective pressure "
+                f"~{calibrated_request_pressure:,} tokens "
+                f"(rough ~{request_pressure_tokens:,}) near the "
+                "context/output limit. Compacting before the next model call."
             )
             messages, active_system_prompt = agent._compress_context(
                 messages,
@@ -1343,7 +1349,20 @@ def run_conversation(
                     "discard_request_calibration",
                     lambda: None,
                 )
-                _begin_request_calibration(request_pressure_tokens)
+                calibration_rough_tokens = request_pressure_tokens
+                current_pressure_route = (agent.provider or "", agent.api_mode or "")
+                if current_pressure_route != request_pressure_route:
+                    # A retry may activate a provider fallback whose wire shape
+                    # differs from the primary request (notably chat-completions
+                    # versus Codex Responses). Pair real usage with an estimate
+                    # produced for the route that is actually being called.
+                    calibration_rough_tokens = estimate_request_tokens_rough(
+                        api_messages,
+                        tools=agent.tools or None,
+                        provider=current_pressure_route[0],
+                        api_mode=current_pressure_route[1],
+                    )
+                _begin_request_calibration(calibration_rough_tokens)
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -4826,7 +4845,10 @@ def run_conversation(
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages,
+                        tools=agent.tools or None,
+                        provider=agent.provider or "",
+                        api_mode=agent.api_mode or "",
                     )
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):

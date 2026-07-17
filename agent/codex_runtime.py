@@ -275,6 +275,11 @@ def _record_codex_app_server_compaction(
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
+        invalidate_calibration = getattr(
+            compressor, "invalidate_matched_calibration", None
+        )
+        if callable(invalidate_calibration):
+            invalidate_calibration()
         compressor.compression_count = getattr(
             compressor, "compression_count", 0
         ) + 1

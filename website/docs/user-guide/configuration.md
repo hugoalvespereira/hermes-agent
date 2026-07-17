@@ -732,6 +732,19 @@ Hermes automatically compresses long conversations to stay within your model's c
 
 All compression settings live in `config.yaml` (no environment variables).
 
+Hermes reserves the configured model output budget before applying the threshold.
+For example, a 372,000-token window with `model.max_tokens: 16384` and
+`compression.threshold: 0.90` triggers at
+`(372000 - 16384) × 0.90 = 320054` input tokens. The reserved 16,384 tokens
+remain available for the answer.
+
+After a successful request, Hermes calibrates its next preflight decision from
+the provider's real input-token count plus the estimated size of only the new
+content. This avoids counting Codex reasoning metadata twice. The calibration
+is stored with the session, so reopening the Desktop or resuming a session does
+not revert to an inflated absolute estimate. Until a provider has returned a
+real count, Hermes keeps the conservative rough estimate.
+
 ### Full reference
 
 ```yaml

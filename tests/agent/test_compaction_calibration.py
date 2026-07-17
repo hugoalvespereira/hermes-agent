@@ -11,6 +11,8 @@ def _compressor(
     *,
     model: str = "gpt-5.6",
     provider: str = "openai-codex",
+    base_url: str = "https://chatgpt.com/backend-api/codex",
+    api_mode: str = "codex_responses",
     context_length: int = 372_000,
     max_tokens: int = 16_384,
 ) -> ContextCompressor:
@@ -21,6 +23,8 @@ def _compressor(
         return ContextCompressor(
             model=model,
             provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
             threshold_percent=0.80,
             max_tokens=max_tokens,
             quiet_mode=True,
@@ -95,10 +99,12 @@ def test_failed_request_estimate_is_not_paired_with_later_usage() -> None:
     assert compressor.calibrated_pressure_tokens(290_458) == 290_458
 
 
-def test_model_provider_context_and_output_budget_changes_invalidate_pair() -> None:
+def test_request_identity_changes_invalidate_pair() -> None:
     changes = [
         {"model": "gpt-5.6-mini"},
         {"provider": "openai"},
+        {"base_url": "https://relay.example/v1"},
+        {"api_mode": "chat_completions"},
         {"context_length": 400_000},
         {"max_tokens": 8_192},
     ]
@@ -109,11 +115,43 @@ def test_model_provider_context_and_output_budget_changes_invalidate_pair() -> N
         compressor.update_model(
             change.get("model", compressor.model),
             change.get("context_length", compressor.context_length),
+            base_url=change.get("base_url", compressor.base_url),
             provider=change.get("provider", compressor.provider),
+            api_mode=change.get("api_mode", compressor.api_mode),
             max_tokens=change.get("max_tokens", compressor.max_tokens),
         )
 
         assert compressor.calibrated_pressure_tokens(290_458) == 290_458
+
+
+def test_persisted_identity_never_contains_raw_base_url_credentials(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    compressor = _compressor(base_url="https://user:secret@example.invalid/v1")
+    compressor.bind_session_state(db, "session-a")
+
+    _record_success(compressor, rough_tokens=290_282, prompt_tokens=201_860)
+
+    state = db.get_compaction_calibration("session-a")
+    assert state is not None
+    assert "secret" not in repr(state["identity"])
+    assert "https://" not in repr(state["identity"])
+    assert state["identity"]["base_url_sha256"]
+
+
+def test_compaction_boundary_clears_persisted_pair(tmp_path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-a", source="tui")
+    compressor = _compressor()
+    compressor.bind_session_state(db, "session-a")
+    _record_success(compressor, rough_tokens=290_282, prompt_tokens=201_860)
+
+    compressor.invalidate_matched_calibration()
+
+    rebuilt = _compressor()
+    rebuilt.bind_session_state(db, "session-a")
+    assert rebuilt.calibrated_pressure_tokens(290_458) == 290_458
+    assert db.get_compaction_calibration("session-a") is None
 
 
 def test_matched_pair_round_trips_across_agent_rebuild_for_same_session(tmp_path) -> None:
