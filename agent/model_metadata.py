@@ -2549,18 +2549,51 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    provider: str = "",
+    api_mode: str = "",
 ) -> int:
-    """Rough token estimate for a full chat-completions request.
+    """Rough token estimate for a full provider request.
 
-    Includes the major payload buckets Hermes sends to providers:
-    system prompt, conversation messages, and tool schemas.  With 50+
-    tools enabled, schemas alone can add 20-30K tokens — a significant
-    blind spot when only counting messages. Image content is counted
-    at a flat per-image cost (see estimate_messages_tokens_rough).
+    Includes the major payload buckets Hermes sends to providers: system
+    prompt, conversation messages, and tool schemas. With 50+ tools enabled,
+    schemas alone can add 20-30K tokens — a significant blind spot when only
+    counting messages. Image content is counted at a flat per-image cost (see
+    :func:`estimate_messages_tokens_rough`).
+
+    OpenAI Codex uses the Responses API and replays a normalized subset of the
+    internal message dictionaries. Estimating the storage representation counts
+    duplicated visible reasoning and provider bookkeeping that are not sent.
+    For that route, estimate the same normalized input shape the transport
+    builds. Tool schemas retain the historical bounded cache because repeatedly
+    serializing a large toolset can stall long-lived GUI processes. Other
+    providers retain the historical conservative estimator.
     """
     total = 0
     if system_prompt:
         total += (len(system_prompt) + 3) // 4
+
+    is_openai_codex_responses = (
+        str(api_mode or "").strip().lower() == "codex_responses"
+        and str(provider or "").strip().lower().replace("_", "-") == "openai-codex"
+    )
+    if is_openai_codex_responses:
+        try:
+            from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+            normalized_messages = _chat_messages_to_responses_input(
+                messages or [],
+                current_issuer_kind="openai_codex",
+            )
+            if normalized_messages:
+                total += estimate_messages_tokens_rough(normalized_messages)
+            if tools:
+                total += _estimate_tools_tokens_rough(tools)
+            return total
+        except Exception as exc:
+            # Estimation must never block an otherwise valid provider request.
+            # Fall back to the existing conservative internal-shape estimate.
+            logger.debug("Codex request-pressure normalization failed: %s", exc)
+
     if messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:

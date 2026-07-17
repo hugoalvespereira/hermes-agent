@@ -142,6 +142,82 @@ class TestEstimateRequestTokensRough:
             estimate_request_tokens_rough(messages, system_prompt="x" * 8, tools=tools)
             assert dumps.call_count == 1
 
+    def test_codex_estimates_provider_payload_not_internal_duplicates(self):
+        """Codex pressure must reflect replayed Responses items, not storage fields."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "visible answer " * 500,
+                "reasoning": "internal reasoning " * 500,
+                "reasoning_content": "internal reasoning " * 500,
+                "codex_reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "enc_" + ("x" * 800),
+                        "_issuer_kind": "openai_codex",
+                    }
+                ],
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "visible answer"}],
+                    }
+                ],
+            },
+        ]
+
+        generic = estimate_request_tokens_rough(messages, system_prompt="system")
+        codex = estimate_request_tokens_rough(
+            messages,
+            system_prompt="system",
+            provider="openai-codex",
+            api_mode="codex_responses",
+        )
+
+        assert codex < generic
+        # Encrypted reasoning is provider input and must still contribute.
+        without_reasoning = [dict(messages[0]), dict(messages[1], codex_reasoning_items=[])]
+        assert codex > estimate_request_tokens_rough(
+            without_reasoning,
+            system_prompt="system",
+            provider="openai-codex",
+            api_mode="codex_responses",
+        )
+
+    def test_non_codex_estimator_keeps_existing_internal_shape(self):
+        messages = [{"role": "assistant", "content": "ok", "reasoning": "r" * 400}]
+        baseline = estimate_request_tokens_rough(messages, system_prompt="system")
+        assert estimate_request_tokens_rough(
+            messages,
+            system_prompt="system",
+            provider="openrouter",
+            api_mode="chat_completions",
+        ) == baseline
+
+    def test_codex_path_keeps_bounded_tool_schema_cache(self):
+        messages = [{"role": "user", "content": "hello"}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+
+        with patch("agent.model_metadata.json.dumps", wraps=__import__("json").dumps) as dumps:
+            for _ in range(2):
+                estimate_request_tokens_rough(
+                    messages,
+                    tools=tools,
+                    provider="openai-codex",
+                    api_mode="codex_responses",
+                )
+        assert dumps.call_count == 1
+
     def test_tools_cache_is_bounded(self):
         # A long-lived process builds many transient tool lists; the cache must
         # not grow without bound. Feed more distinct lists than the cap and
