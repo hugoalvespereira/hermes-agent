@@ -2490,8 +2490,11 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
     content = msg.get("content") if isinstance(msg, dict) else None
-    if isinstance(content, list):
-        for part in content:
+    for parts_key in ("content", "output"):
+        parts = msg.get(parts_key) if isinstance(msg, dict) else None
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
             if not isinstance(part, dict):
                 continue
             ptype = part.get("type")
@@ -2507,7 +2510,11 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
         inner = content.get("content")
         if isinstance(inner, list):
             for part in inner:
-                if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
+                if isinstance(part, dict) and part.get("type") in {
+                    "image",
+                    "image_url",
+                    "input_image",
+                }:
                     count += 1
     return count * cost_per_image
 
@@ -2524,7 +2531,7 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     for k, v in msg.items():
         if k == "_anthropic_content_blocks":
             continue
-        if k == "content":
+        if k in {"content", "output"}:
             if isinstance(v, list):
                 cleaned = []
                 for part in v:
@@ -2620,7 +2627,7 @@ def estimate_request_tokens_rough(
 # Bump whenever the provider-payload estimator or prompt/tool shape
 # canonicalization changes. Durable calibration pairs include this value so a
 # release cannot silently reuse measurements produced by different accounting.
-REQUEST_TOKEN_ESTIMATOR_VERSION = 2
+REQUEST_TOKEN_ESTIMATOR_VERSION = 3
 
 
 def _canonical_tool_shape(tool: Any) -> Any:

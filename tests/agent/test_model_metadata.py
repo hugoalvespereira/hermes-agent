@@ -207,6 +207,47 @@ class TestEstimateRequestTokensRough:
 
         assert embedded == explicit
 
+    def test_codex_tool_output_with_huge_image_stays_bounded(self):
+        huge = "A" * (4 * 1024 * 1024)
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_vision",
+                        "type": "function",
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image_url":"/tmp/page.png"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_vision",
+                "content": [
+                    {"type": "text", "text": "image attached"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{huge}",
+                        },
+                    },
+                ],
+            },
+        ]
+
+        result = estimate_request_tokens_rough(
+            messages,
+            system_prompt="system",
+            provider="openai-codex",
+            api_mode="codex_responses",
+        )
+
+        assert 1_500 <= result < 5_000
+
     def test_terminal_codex_payload_counts_reasoning_replay_without_reconversion(self):
         payload = {
             "instructions": "system",
