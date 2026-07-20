@@ -1,6 +1,8 @@
 import sys
 import types
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -10,6 +12,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.model_metadata import request_prompt_tool_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -821,6 +824,70 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_codex_omitted_output_cap_keeps_preflight_calibration(monkeypatch):
+    agent: Any = _build_agent(monkeypatch)
+    agent.max_tokens = 16_384
+    agent.context_compressor.max_tokens = 16_384
+    agent.context_compressor.context_length = 200_000
+    agent.context_compressor.threshold_tokens = 100_000
+    agent._cached_system_prompt = "You are helpful."
+
+    shape = request_prompt_tool_fingerprint(
+        {
+            "instructions": agent._cached_system_prompt,
+            "tools": agent.tools or [],
+        }
+    )
+    agent.context_compressor.set_request_calibration_shape(
+        shape,
+        effective_output_cap=None,
+    )
+    attempt = agent.context_compressor.begin_request_calibration(
+        113_000,
+        prompt_tool_fingerprint=shape,
+        effective_output_cap=None,
+    )
+    agent.context_compressor.update_from_response(
+        {"prompt_tokens": 58_000},
+        calibration_attempt_id=attempt,
+    )
+
+    history = []
+    for index in range(20):
+        history.extend(
+            [
+                {"role": "user", "content": f"Message {index} padded"},
+                {"role": "assistant", "content": f"Response {index} padded"},
+            ]
+        )
+
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: _codex_message_response("Used matched usage"),
+    )
+    with (
+        monkeypatch.context() as scoped,
+        patch.object(
+            agent,
+            "_compress_context",
+            side_effect=AssertionError("matched Codex usage should prevent compaction"),
+        ),
+    ):
+        scoped.setattr(
+            "agent.turn_context.estimate_request_tokens_rough",
+            lambda *args, **kwargs: 114_000,
+        )
+        scoped.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough",
+            lambda *args, **kwargs: 114_000,
+        )
+        result = agent.run_conversation("hello", conversation_history=history)
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Used matched usage"
+
+
 def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
     """The dispatch chokepoint must sanitize after every mutable layer."""
     agent = _build_copilot_agent(monkeypatch)
@@ -1629,6 +1696,85 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert len(compress_calls) == 1
     assert compress_calls[0] >= 15_000
     assert len(requests) == 2
+
+
+def test_codex_omitted_output_cap_keeps_mid_turn_calibration(monkeypatch):
+    agent: Any = _build_agent(monkeypatch)
+    agent.max_tokens = 16_384
+    agent.context_compressor.max_tokens = 16_384
+    agent.context_compressor.context_length = 200_000
+    agent.context_compressor.threshold_tokens = 100_000
+    agent._cached_system_prompt = "You are helpful."
+
+    shape = request_prompt_tool_fingerprint(
+        {
+            "instructions": agent._cached_system_prompt,
+            "tools": agent.tools or [],
+        }
+    )
+    agent.context_compressor.set_request_calibration_shape(
+        shape,
+        effective_output_cap=None,
+    )
+    attempt = agent.context_compressor.begin_request_calibration(
+        113_000,
+        prompt_tool_fingerprint=shape,
+        effective_output_cap=None,
+    )
+    agent.context_compressor.update_from_response(
+        {"prompt_tokens": 58_000},
+        calibration_attempt_id=attempt,
+    )
+
+    responses = [
+        _codex_tool_call_response(),
+        _codex_message_response("Finished without compaction."),
+    ]
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: responses.pop(0),
+    )
+
+    def _fake_execute_tool_calls(
+        assistant_message,
+        messages,
+        effective_task_id,
+        api_call_count=0,
+    ):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    with patch.object(
+        agent,
+        "_compress_context",
+        side_effect=AssertionError("matched Codex usage should prevent compaction"),
+    ):
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                return_value=114_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                return_value=114_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_provider_request_tokens_rough",
+                return_value=113_000,
+            ),
+        ):
+            result = agent.run_conversation("run a command")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Finished without compaction."
 
 
 def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):

@@ -4,7 +4,10 @@ import sqlite3
 from unittest.mock import patch
 
 from agent.context_compressor import ContextCompressor
-from agent.model_metadata import request_prompt_tool_fingerprint
+from agent.model_metadata import (
+    provider_facing_output_cap_for_preflight,
+    request_prompt_tool_fingerprint,
+)
 from hermes_state import SessionDB
 
 
@@ -174,6 +177,38 @@ def test_effective_output_cap_is_attempt_identity_not_configured_default() -> No
 
     compressor.set_request_calibration_shape(stable_shape, effective_output_cap=16_384)
     assert compressor.calibrated_pressure_tokens(102_000) == 102_000
+
+
+def test_codex_backend_preflight_uses_its_omitted_provider_output_cap() -> None:
+    """Codex OAuth omits max_output_tokens, so preflight must identify it likewise."""
+    compressor = _compressor(max_tokens=16_384)
+    stable_shape = _shape()
+    preflight_cap = provider_facing_output_cap_for_preflight(
+        16_384,
+        provider="openai-codex",
+        api_mode="codex_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    assert preflight_cap is None
+
+    compressor.set_request_calibration_shape(
+        stable_shape,
+        effective_output_cap=preflight_cap,
+    )
+    attempt = compressor.begin_request_calibration(
+        100_000,
+        prompt_tool_fingerprint=stable_shape,
+        effective_output_cap=None,
+    )
+    compressor.update_from_response(
+        {"prompt_tokens": 70_000}, calibration_attempt_id=attempt
+    )
+
+    compressor.set_request_calibration_shape(
+        stable_shape,
+        effective_output_cap=preflight_cap,
+    )
+    assert compressor.calibrated_pressure_tokens(101_000) == 71_000
 
 
 def test_retry_output_cap_changes_effective_compaction_threshold() -> None:

@@ -33,6 +33,7 @@ from agent.iteration_budget import IterationBudget
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    provider_facing_output_cap_for_preflight,
     request_prompt_tool_fingerprint,
 )
 
@@ -393,7 +394,12 @@ def build_turn_context(
                     "instructions": active_system_prompt or "",
                     "tools": agent.tools or [],
                 }),
-                effective_output_cap=_preflight_output_cap,
+                effective_output_cap=provider_facing_output_cap_for_preflight(
+                    _preflight_output_cap,
+                    provider=agent.provider or "",
+                    api_mode=agent.api_mode or "",
+                    base_url=agent.base_url or "",
+                ),
             )
         _calibrated_pressure = getattr(
             _compressor,

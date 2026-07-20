@@ -2705,6 +2705,41 @@ def effective_output_cap_from_request(request: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def provider_facing_output_cap_for_preflight(
+    output_cap: Any,
+    *,
+    provider: str = "",
+    api_mode: str = "",
+    base_url: str = "",
+) -> Optional[int]:
+    """Predict the cap represented by the current provider transport.
+
+    The ChatGPT Codex backend deliberately omits ``max_output_tokens`` even
+    when Hermes has a configured output budget. Calibration identity is bound
+    to the provider-facing request, while threshold calculation still uses the
+    configured budget separately. Returning the configured value here would
+    therefore invalidate every matched Codex pair on the next preflight.
+    """
+    cap: Optional[int] = None
+    if output_cap is not None and not isinstance(output_cap, bool):
+        try:
+            parsed = int(output_cap)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            cap = parsed
+
+    base_url_text = str(base_url or "")
+    is_codex_backend = api_mode == "codex_responses" and (
+        provider == "openai-codex"
+        or (
+            base_url_host_matches(base_url_text, "chatgpt.com")
+            and "/backend-api/codex" in base_url_text.lower()
+        )
+    )
+    return None if is_codex_backend else cap
+
+
 def _serialized_length_for_token_estimate(value: Any) -> int:
     if isinstance(value, str):
         return len(value)

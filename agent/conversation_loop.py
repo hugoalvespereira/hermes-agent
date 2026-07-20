@@ -56,6 +56,7 @@ from agent.model_metadata import (
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    provider_facing_output_cap_for_preflight,
     request_prompt_tool_fingerprint,
     save_context_length,
 )
@@ -1021,7 +1022,12 @@ def run_conversation(
         if callable(_set_calibration_shape):
             _set_calibration_shape(
                 _preflight_shape,
-                effective_output_cap=_preflight_output_cap,
+                effective_output_cap=provider_facing_output_cap_for_preflight(
+                    _preflight_output_cap,
+                    provider=agent.provider or "",
+                    api_mode=agent.api_mode or "",
+                    base_url=agent.base_url or "",
+                ),
             )
         _calibrated_pressure = getattr(
             _compressor, "calibrated_pressure_tokens", lambda tokens: tokens
