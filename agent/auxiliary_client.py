@@ -1526,8 +1526,13 @@ class _CodexCompletionsAdapter:
             native_compaction_eligible=False,
         )
 
+        from agent.model_metadata import strip_codex_context_variant_suffix
+        wire_model = (
+            strip_codex_context_variant_suffix(model)
+            if base_url_host_matches(_host_for_input, "chatgpt.com") else model
+        )
         resp_kwargs: Dict[str, Any] = {
-            "model": model,
+            "model": wire_model,
             "instructions": instructions,
             "input": input_items or [{"role": "user", "content": ""}],
             "store": False,

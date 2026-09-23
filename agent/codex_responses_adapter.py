@@ -1120,8 +1120,9 @@ def _preflight_codex_api_kwargs(
         "prompt_cache_retention", "service_tier", "context_management",
         "extra_headers", "extra_body", "timeout",
     }
+    from agent.model_metadata import strip_codex_context_variant_suffix
     normalized: Dict[str, Any] = {
-        "model": model,
+        "model": strip_codex_context_variant_suffix(model) if sanitize_harmony_tokens else model,
         "instructions": instructions,
         "input": normalized_input,
         "store": False,

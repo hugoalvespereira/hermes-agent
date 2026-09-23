@@ -653,6 +653,10 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+        # Context variants are Hermes-side aliases, never provider model IDs.
+        from agent.model_metadata import strip_codex_context_variant_suffix
+        if is_codex_backend:
+            kwargs["model"] = strip_codex_context_variant_suffix(kwargs["model"])
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
