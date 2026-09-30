@@ -38,6 +38,7 @@ from agent.vault_store import (  # noqa: E402
     normalize_origin,
     scrub_secret_from_text,
 )
+from tools.browser_supervisor_frames import FrameTarget  # noqa: E402
 
 
 @pytest.fixture()
@@ -332,10 +333,10 @@ class TestBrowserVaultTools:
         ]
         secret_exprs = []
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression, session_id=None):
+        def fake_eval_secret(task_id, expression, frame=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 1})}
 
@@ -394,14 +395,14 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
         secret_exprs = []
 
-        def fake_eval_secret(task_id, expression, session_id=None):
+        def fake_eval_secret(task_id, expression, frame=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 1})}
 
@@ -438,13 +439,13 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             if "location.href" in expression:
                 # Pre-check sees the allowed origin.
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression, session_id=None):
+        def fake_eval_secret(task_id, expression, frame=None):
             # The evaluated script itself must carry the origin assert.
             assert "window.location.origin" in expression
             assert '"https://example.com"' in expression
@@ -476,7 +477,7 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
@@ -497,19 +498,22 @@ class TestBrowserVaultTools:
         assert "s3cret-pw" not in json.dumps([str(c) for c in run_cmd.call_args_list]) and "s3cret-pw" not in raw
 
     class _FrameSupervisor:
-        """Top page https://login.bankid.no (no form) embeds the password form in an OOPIF (session child-1)."""
+        """Top page https://login.bankid.no (no form) embeds the password form in an iframe, addressed as
+        context 7 of session page-A (a same-site iframe shares its tab's session)."""
+
+        FRAME = FrameTarget("page-A", 7)
 
         def __init__(self, child_href):
             self.child_href, self.calls = child_href, []
 
         def focus_page(self, origin, *, accept=None):
             if origin == "https://csfe.bankid.no":
-                return {"ok": True, "url": "https://csfe.bankid.no/login", "session_id": "child-1"}
+                return {"ok": True, "url": "https://csfe.bankid.no/login", "frame": self.FRAME}
             return {"ok": False, "error": "no open page"}
 
-        def evaluate_runtime(self, expression, *, session_id=None):
-            self.calls.append((session_id, expression))
-            if session_id != "child-1":
+        def evaluate_runtime(self, expression, *, frame=None):
+            self.calls.append((frame, expression))
+            if frame != self.FRAME:
                 return {"ok": True, "result": "https://login.bankid.no/" if "location.href" in expression else "[]"}
             if expression == "window.location.href":
                 return {"ok": True, "result": self.child_href}
@@ -520,7 +524,7 @@ class TestBrowserVaultTools:
 
     def test_fill_targets_the_cross_origin_frame_bound_to_the_item(self, store):
         """BankID: the login is bound to the iframe's origin, not the top page's. Origin proof, inspection and
-        the write all run in that frame's session, so proof scope equals mutation scope."""
+        the write all run in that frame's execution context, so proof scope equals mutation scope."""
         from tools import browser_vault_tool
 
         meta = _add_login(store, origin="https://csfe.bankid.no")
@@ -532,7 +536,7 @@ class TestBrowserVaultTools:
         out = json.loads(raw)
         assert out["success"] is True and out["filled_fields"] == 1
         assert out["origin"] == "https://csfe.bankid.no"
-        assert {sid for sid, _ in sup.calls} == {"child-1"}
+        assert {frame for frame, _ in sup.calls} == {self._FrameSupervisor.FRAME}
         [fill_expr] = [e for _, e in sup.calls if "s3cret-pw" in e]
         assert '"https://csfe.bankid.no"' in fill_expr
         assert "s3cret-pw" not in raw
@@ -566,12 +570,12 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression, session_id=None):
+        def fake_eval_secret(task_id, expression, frame=None):
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         try:
@@ -612,14 +616,14 @@ class TestBrowserVaultTools:
             {"autocomplete": "email", "index": 3, "type": "email"},
         ]
 
-        def fake_eval(task_id, expression, session_id=None):
+        def fake_eval(task_id, expression, frame=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://shop.test/checkout"}
             return {"success": True, "result": json.dumps(controls)}
 
         secret_exprs = []
 
-        def fake_eval_secret(task_id, expression, session_id=None):
+        def fake_eval_secret(task_id, expression, frame=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 3})}
 
@@ -724,7 +728,7 @@ class TestSaveLoginPrompt:
             return {"identifier": "tek@acme.test", "password": "hunter2-very-secret"}
 
         unlock_mod.set_save_login_prompt_callback(prompt)
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, session_id=None: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, frame=None: "https://acme.test")
         monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
                             lambda handle, task_id=None: json.dumps({"success": True, "filled_fields": 1}))
         with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -742,7 +746,7 @@ class TestSaveLoginPrompt:
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
 
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, session_id=None: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, frame=None: "https://acme.test")
         with patch("agent.vault_store.get_vault_store", return_value=store):
             unlock_mod.set_save_login_prompt_callback(lambda origin, site: None)
             with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
@@ -811,10 +815,10 @@ class TestTwoFactor:
         controls = [{"index": 0, "type": "text", "name": "otp", "label": "Authentication code", "autocomplete": "one-time-code"}]
         seen = {}
 
-        def fake_eval(task_id, expr, session_id=None):
+        def fake_eval(task_id, expr, frame=None):
             return {"success": True, "result": json.dumps(controls) if "querySelectorAll" in expr else "https://github.com/sessions/two-factor"}
 
-        def fake_secret(task_id, expr, session_id=None):
+        def fake_secret(task_id, expr, frame=None):
             seen["expr"] = expr
             return {"success": True, "result": json.dumps({"filled": 1})}
 

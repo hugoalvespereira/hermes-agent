@@ -1,9 +1,10 @@
-"""OOPIF session lookup that lets the vault fill a form inside a cross-origin iframe."""
+"""Frame lookup that lets the vault fill a form inside a cross-origin iframe, in-process or OOPIF."""
 
 import asyncio
+import threading
 
 from tools.browser_supervisor import CDPSupervisor
-from tools.browser_supervisor_frames import FrameInfo
+from tools.browser_supervisor_frames import FrameInfo, FrameTarget
 
 
 def _oopif(frame_id, sid, parent_sid, url):
@@ -40,3 +41,43 @@ def test_target_attach_records_the_embedder_session():
 
     asyncio.run(run())
     assert sup.oopif_sessions("page-A") == [("child-1", "https://csfe.bankid.no/login")]
+
+
+def test_focus_page_resolves_a_same_site_iframe_that_has_no_session_of_its_own():
+    """login.bankid.no embeds csfe.bankid.no: same site, so Chrome renders the iframe in the tab's process and
+    it never gets a CDP session. focus_page must still find it and hand back a context bound to that frame."""
+    sup = CDPSupervisor(task_id="t", cdp_url="ws://127.0.0.1:1/devtools/browser/x")
+    contexts = {"top": 1, "child": 2}
+    probes = []
+
+    async def cdp(method, params=None, *, session_id=None, timeout=10.0):
+        params = params or {}
+        if method == "Target.getTargets":
+            return {"result": {"targetInfos": [{"type": "page", "targetId": "T1", "url": "https://login.bankid.no/"}]}}
+        if method == "Target.attachToTarget":
+            return {"result": {"sessionId": "page-A"}}
+        if method == "Page.getFrameTree":
+            return {"result": {"frameTree": {
+                "frame": {"id": "top", "url": "https://login.bankid.no/"},
+                "childFrames": [{"frame": {"id": "child", "url": "https://csfe.bankid.no/login", "parentId": "top"}}]}}}
+        if method == "Page.createIsolatedWorld":
+            return {"result": {"executionContextId": contexts[params["frameId"]]}}
+        if method == "Runtime.evaluate" and "contextId" in params:
+            probes.append(params["contextId"])
+            return {"result": {"result": {"value": params["contextId"] == contexts["child"]}}}
+        return {"result": {}}
+
+    sup._cdp = cdp
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    sup._loop = loop
+    try:
+        out = sup.focus_page("https://csfe.bankid.no", accept="!!document.querySelector('input[type=password]')")
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+    assert out == {"ok": True, "url": "https://csfe.bankid.no/login", "frame": FrameTarget("page-A", contexts["child"])}
+    assert probes == [contexts["child"]]  # the origin-mismatched top document was never probed
+    assert sup._page_session_id == "page-A"

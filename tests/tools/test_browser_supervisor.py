@@ -324,10 +324,13 @@ def test_evaluate_runtime_unserializable_value(chrome_cdp, supervisor_registry):
     assert out["result"] == "Infinity"
 
 
-def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp, supervisor_registry, tmp_path):
-    """BankID shape: the top page (127.0.0.1) embeds the login form from another site (localhost), which
-    ``--site-per-process`` makes an OOPIF. The real browser_vault_fill finds the frame, proves its origin and
-    writes there; the top document is never the target."""
+@pytest.mark.parametrize("iframe_host", ["localhost", "127.0.0.1"], ids=["cross-site-oopif", "same-site-in-process"])
+def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp, supervisor_registry, tmp_path, iframe_host):
+    """BankID shape: the top page (127.0.0.1:A) embeds the login form from another origin (<host>:B). On
+    ``localhost`` that is another site, which ``--site-per-process`` makes an OOPIF; on ``127.0.0.1`` it is the
+    same site (login.bankid.no / csfe.bankid.no), rendered in the top page's process with no session of its own.
+    The real browser_vault_fill finds the frame, proves its origin and writes there; the top document is never
+    the target."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from unittest.mock import patch
@@ -337,10 +340,12 @@ def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp,
     from agent.vault_store import VaultStore
     from tools import browser_vault_tool
 
+    form_server = None
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            port = self.server.server_address[1]
-            body = (f'<h1>top</h1><iframe src="http://localhost:{port}/form"></iframe>' if self.path == "/top"
+            body = (f'<h1>top</h1><iframe src="http://{iframe_host}:{form_server.server_address[1]}/form"></iframe>'
+                    if self.path == "/top"
                     else '<form><input name="user"><input type="password" name="pw" autocomplete="current-password"></form>')
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -350,9 +355,10 @@ def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp,
         def log_message(self, *_a):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    port = server.server_address[1]
+    top_server, form_server = (ThreadingHTTPServer(("127.0.0.1", 0), Handler) for _ in range(2))
+    for server in (top_server, form_server):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    form_origin = f"http://{iframe_host}:{form_server.server_address[1]}"
     cdp_url, _ = chrome_cdp
     try:
         supervisor = supervisor_registry.get_or_start(task_id="pytest-vault-frame", cdp_url=cdp_url)
@@ -360,7 +366,7 @@ def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp,
         async def open_tab():  # the tab browser_exec would open, not the one the supervisor attached to
             async with _ws_mod.connect(cdp_url) as ws:
                 await ws.send(json.dumps({"id": 1, "method": "Target.createTarget",
-                                          "params": {"url": f"http://127.0.0.1:{port}/top"}}))
+                                          "params": {"url": f"http://127.0.0.1:{top_server.server_address[1]}/top"}}))
                 while json.loads(await ws.recv()).get("id") != 1:
                     pass
         asyncio.run(open_tab())
@@ -368,19 +374,21 @@ def test_vault_fill_reaches_a_password_form_in_a_cross_origin_iframe(chrome_cdp,
 
         store = VaultStore(base_dir=tmp_path / "vault")
         meta = store.add_item("login", "frame", {"identifier_type": "username", "identifier": "u",
-                                                 "password": "frame-s3cret"}, origin=f"http://localhost:{port}")
+                                                 "password": "frame-s3cret"}, origin=form_origin)
         with patch("agent.vault_store.get_vault_store", return_value=store):
             raw = browser_vault_tool.browser_vault_fill(meta.id, task_id="pytest-vault-frame")
         out = json.loads(raw)
-        assert out["success"] is True and out["origin"] == f"http://localhost:{port}", raw
+        assert out["success"] is True and out["origin"] == form_origin, raw
         assert "frame-s3cret" not in raw
 
         # Ordering assumption: the tab's existing OOPIF is known as soon as focus_page's attach returns.
-        focused = supervisor.focus_page(f"http://localhost:{port}")
-        assert focused["ok"] and focused["session_id"] != supervisor._page_session_id
-        read = supervisor.evaluate_runtime("document.querySelector('input[name=pw]').value",
-                                           session_id=focused["session_id"])
+        focused = supervisor.focus_page(form_origin)
+        assert focused["ok"], focused
+        # Only the same-site iframe lives in the tab's own session: proves that row is not passing via an OOPIF.
+        assert (focused["frame"].session_id == supervisor._page_session_id) == (iframe_host == "127.0.0.1")
+        read = supervisor.evaluate_runtime("document.querySelector('input[name=pw]').value", frame=focused["frame"])
         assert read["result"] == "frame-s3cret"
-        assert supervisor.evaluate_runtime("location.host")["result"] == f"127.0.0.1:{port}"
+        assert supervisor.evaluate_runtime("document.querySelector('input[name=pw]')")["result"] is None
     finally:
-        server.shutdown()
+        for server in (top_server, form_server):
+            server.shutdown()

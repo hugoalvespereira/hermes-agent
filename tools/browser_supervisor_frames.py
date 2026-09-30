@@ -47,6 +47,15 @@ class FrameInfo:
         return d
 
 
+@dataclass(frozen=True)
+class FrameTarget:
+    """Where Runtime.evaluate runs: a CDP session plus an execution context created in ONE frame of it.
+    The context dies with that frame's document, so a navigated frame can no longer be evaluated in."""
+
+    session_id: str
+    context_id: int
+
+
 class FrameTrackingMixin:
     """Frame-tree bookkeeping for ``CDPSupervisor`` (event handlers run on its loop)."""
 
@@ -147,6 +156,25 @@ class FrameTrackingMixin:
             if parent == page_session_id:
                 out.append((sid, frame.url))
         return out
+
+    async def _local_frames(self, session_id: str, *, timeout: float) -> List[Tuple[str, str]]:
+        """``(frame_id, url)`` of every frame rendered in ``session_id``'s process, top first. Same-site
+        iframes live here with no session of their own; ``Page.getFrameTree`` omits OOPIF children, which
+        are separate sessions (see ``oopif_sessions``)."""
+        tree = (await self._cdp("Page.getFrameTree", session_id=session_id, timeout=timeout)).get("result", {})
+        out, stack = [], [tree.get("frameTree") or {}]
+        while stack:
+            node = stack.pop(0)
+            frame = node.get("frame") or {}
+            if frame.get("id"):
+                out.append((frame["id"], str(frame.get("url") or "")))
+            stack.extend(node.get("childFrames") or [])
+        return out
+
+    async def _frame_context(self, session_id: str, frame_id: str, *, timeout: float) -> FrameTarget:
+        """An isolated-world execution context bound to ``frame_id``'s current document."""
+        world = await self._cdp("Page.createIsolatedWorld", {"frameId": frame_id}, session_id=session_id, timeout=timeout)
+        return FrameTarget(session_id, int(world["result"]["executionContextId"]))
 
     def _build_frame_tree_locked(self) -> Dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

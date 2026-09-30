@@ -24,7 +24,7 @@ from tools.browser_supervisor_dialogs import (
     DEFAULT_DIALOG_POLICY, DEFAULT_DIALOG_TIMEOUT_S, RECENT_DIALOGS_MAX, _VALID_POLICIES, DialogRecord,
     DialogSupervisionMixin, PendingDialog,
 )
-from tools.browser_supervisor_frames import FrameInfo, FrameTrackingMixin
+from tools.browser_supervisor_frames import FrameInfo, FrameTarget, FrameTrackingMixin
 
 # ``websockets`` costs ~22 ms at import and is only needed once a supervisor connects.
 if TYPE_CHECKING:
@@ -208,9 +208,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _err(e)
         return {"ok": True, "dialog": dialog.to_dict()}
 
-    def evaluate_runtime(self, expression: str, *, session_id: Optional[str] = None, return_by_value: bool = True,
+    def evaluate_runtime(self, expression: str, *, frame: Optional[FrameTarget] = None, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
-        """Evaluate ``expression`` in the page's (or ``session_id``'s frame) Runtime context over the live WS.
+        """Evaluate ``expression`` in the page's default Runtime context (or in ``frame``) over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
@@ -218,7 +218,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
         with self._state_lock:
-            active, session_id = self._active, session_id or self._page_session_id
+            active, session_id = self._active, frame.session_id if frame else self._page_session_id
         if not active:
             return _fail("supervisor is not active")
         if not session_id:
@@ -228,6 +228,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # userGesture: clipboard / fullscreen APIs need user activation.
             params = {"expression": expression, "returnByValue": by_value,
                       "awaitPromise": await_promise, "userGesture": True}
+            if frame:
+                params["contextId"] = frame.context_id
             coro = self._cdp("Runtime.evaluate", params, session_id=session_id, timeout=timeout)
             return _schedule(coro, loop, timeout=timeout + 1)
 
@@ -267,11 +269,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         """Re-attach the supervisor's page session to the open tab holding a frame on ``origin``
         (``scheme://host[:port]``; ``""`` = any http(s) origin). The initial attach picks the FIRST
         page target, but tools that open their own tabs (browser_exec) put the login form somewhere
-        else, and the form may sit in a cross-origin iframe (OOPIF). Each tab's top document and its
-        OOPIFs are candidates; with ``accept`` (a JS expression) the first frame on ``origin`` where it
-        evaluates truthy wins, so a login and a checkout tab on one site resolve to the right one.
-        Returns ``{"ok": True, "url", "session_id"}`` naming the matched frame, or ``{"ok": False,
-        "error"}``; on failure the previous session stays."""
+        else, and the form may sit in a cross-origin iframe. Each frame of each tab, in-process (same-site)
+        or OOPIF (cross-site), is a candidate; with ``accept`` (a JS expression) the first frame on
+        ``origin`` where it evaluates truthy wins, so a login and a checkout tab on one site resolve to
+        the right one. Returns ``{"ok": True, "url", "frame"}`` with the matched frame's ``FrameTarget``,
+        or ``{"ok": False, "error"}``; on failure the previous session stays."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -283,18 +285,20 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             await self._install_dialog_bridge(sid)
             return sid
 
-        async def _matches(sid: str, url: str) -> bool:
+        async def _resolve(sid: str, frame_id: str, url: str) -> Optional[FrameTarget]:
             from agent.vault_store import normalize_origin
             try:
                 if not url.startswith(("http://", "https://")) or (origin and normalize_origin(url) != origin):
-                    return False
+                    return None
             except Exception:
-                return False
+                return None
+            target = await self._frame_context(sid, frame_id, timeout=timeout)
             if not accept:
-                return True
-            probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
+                return target
+            probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True,
+                                                         "contextId": target.context_id},
                                     session_id=sid, timeout=timeout)
-            return bool(probe.get("result", {}).get("result", {}).get("value"))
+            return target if probe.get("result", {}).get("result", {}).get("value") else None
 
         async def _focus() -> Dict[str, Any]:
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
@@ -303,11 +307,12 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                     continue
                 sid = await _attach(t["targetId"])
                 # setAutoAttach (in _attach) reports the tab's existing OOPIFs before it returns.
-                for frame_sid, url in [(sid, str(t.get("url") or ""))] + self.oopif_sessions(sid):
-                    if await _matches(frame_sid, url):
-                        with self._state_lock:
-                            self._page_session_id = sid
-                        return {"ok": True, "url": url, "session_id": frame_sid}
+                for frame_sid in [sid] + [s for s, _ in self.oopif_sessions(sid)]:
+                    for frame_id, url in await self._local_frames(frame_sid, timeout=timeout):
+                        if target := await _resolve(frame_sid, frame_id, url):
+                            with self._state_lock:
+                                self._page_session_id = sid
+                            return {"ok": True, "url": url, "frame": target}
                 await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept else ""))
 
