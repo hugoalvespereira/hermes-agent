@@ -332,10 +332,10 @@ class TestBrowserVaultTools:
         ]
         secret_exprs = []
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression):
+        def fake_eval_secret(task_id, expression, session_id=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 1})}
 
@@ -394,14 +394,14 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 1, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
         secret_exprs = []
 
-        def fake_eval_secret(task_id, expression):
+        def fake_eval_secret(task_id, expression, session_id=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 1})}
 
@@ -438,13 +438,13 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             if "location.href" in expression:
                 # Pre-check sees the allowed origin.
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression):
+        def fake_eval_secret(task_id, expression, session_id=None):
             # The evaluated script itself must carry the origin assert.
             assert "window.location.origin" in expression
             assert '"https://example.com"' in expression
@@ -476,7 +476,7 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
@@ -496,6 +496,61 @@ class TestBrowserVaultTools:
         assert all(call.args[1] == "get" for call in run_cmd.call_args_list), run_cmd.call_args_list
         assert "s3cret-pw" not in json.dumps([str(c) for c in run_cmd.call_args_list]) and "s3cret-pw" not in raw
 
+    class _FrameSupervisor:
+        """Top page https://login.bankid.no (no form) embeds the password form in an OOPIF (session child-1)."""
+
+        def __init__(self, child_href):
+            self.child_href, self.calls = child_href, []
+
+        def focus_page(self, origin, *, accept=None):
+            if origin == "https://csfe.bankid.no":
+                return {"ok": True, "url": "https://csfe.bankid.no/login", "session_id": "child-1"}
+            return {"ok": False, "error": "no open page"}
+
+        def evaluate_runtime(self, expression, *, session_id=None):
+            self.calls.append((session_id, expression))
+            if session_id != "child-1":
+                return {"ok": True, "result": "https://login.bankid.no/" if "location.href" in expression else "[]"}
+            if expression == "window.location.href":
+                return {"ok": True, "result": self.child_href}
+            if "s3cret-pw" in expression:
+                return {"ok": True, "result": json.dumps({"filled": 1})}
+            return {"ok": True, "result": json.dumps([{"autocomplete": "current-password", "formIndex": 0, "index": 0,
+                                                       "label": "", "name": "pw", "type": "password"}])}
+
+    def test_fill_targets_the_cross_origin_frame_bound_to_the_item(self, store):
+        """BankID: the login is bound to the iframe's origin, not the top page's. Origin proof, inspection and
+        the write all run in that frame's session, so proof scope equals mutation scope."""
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://csfe.bankid.no")
+        sup = self._FrameSupervisor("https://csfe.bankid.no/login")
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+            reg.get.return_value = sup
+            raw = browser_vault_tool.browser_vault_fill(meta.id)
+        out = json.loads(raw)
+        assert out["success"] is True and out["filled_fields"] == 1
+        assert out["origin"] == "https://csfe.bankid.no"
+        assert {sid for sid, _ in sup.calls} == {"child-1"}
+        [fill_expr] = [e for _, e in sup.calls if "s3cret-pw" in e]
+        assert '"https://csfe.bankid.no"' in fill_expr
+        assert "s3cret-pw" not in raw
+
+    def test_frame_whose_live_origin_differs_is_refused_before_any_secret_eval(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="https://csfe.bankid.no")
+        sup = self._FrameSupervisor("https://evil.example/login")
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+            reg.get.return_value = sup
+            raw = browser_vault_tool.browser_vault_fill(meta.id)
+        out = json.loads(raw)
+        assert out["error_type"] == "origin_mismatch"
+        assert not any("s3cret-pw" in e for _, e in sup.calls)
+        assert "s3cret-pw" not in raw
+
 
     def test_vault_canary_redacted_from_browser_cdp_results(self, store):
         """P1-1 regression: a filled, non-token-shaped canary password must be
@@ -511,12 +566,12 @@ class TestBrowserVaultTools:
             {"autocomplete": "current-password", "formIndex": 0, "index": 0, "label": "", "name": "pw", "type": "password"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://example.com/login"}
             return {"success": True, "result": json.dumps(controls)}
 
-        def fake_eval_secret(task_id, expression):
+        def fake_eval_secret(task_id, expression, session_id=None):
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         try:
@@ -557,14 +612,14 @@ class TestBrowserVaultTools:
             {"autocomplete": "email", "index": 3, "type": "email"},
         ]
 
-        def fake_eval(task_id, expression):
+        def fake_eval(task_id, expression, session_id=None):
             if "location.href" in expression:
                 return {"success": True, "result": "https://shop.test/checkout"}
             return {"success": True, "result": json.dumps(controls)}
 
         secret_exprs = []
 
-        def fake_eval_secret(task_id, expression):
+        def fake_eval_secret(task_id, expression, session_id=None):
             secret_exprs.append(expression)
             return {"success": True, "result": json.dumps({"filled": 3})}
 
@@ -669,7 +724,7 @@ class TestSaveLoginPrompt:
             return {"identifier": "tek@acme.test", "password": "hunter2-very-secret"}
 
         unlock_mod.set_save_login_prompt_callback(prompt)
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, session_id=None: "https://acme.test")
         monkeypatch.setattr(browser_vault_tool, "browser_vault_fill",
                             lambda handle, task_id=None: json.dumps({"success": True, "filled_fields": 1}))
         with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -687,7 +742,7 @@ class TestSaveLoginPrompt:
         from agent.vault_backends import unlock as unlock_mod
         from tools import browser_vault_tool
 
-        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: "https://acme.test")
+        monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, session_id=None: "https://acme.test")
         with patch("agent.vault_store.get_vault_store", return_value=store):
             unlock_mod.set_save_login_prompt_callback(lambda origin, site: None)
             with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True):
@@ -756,15 +811,15 @@ class TestTwoFactor:
         controls = [{"index": 0, "type": "text", "name": "otp", "label": "Authentication code", "autocomplete": "one-time-code"}]
         seen = {}
 
-        def fake_eval(task_id, expr):
+        def fake_eval(task_id, expr, session_id=None):
             return {"success": True, "result": json.dumps(controls) if "querySelectorAll" in expr else "https://github.com/sessions/two-factor"}
 
-        def fake_secret(task_id, expr):
+        def fake_secret(task_id, expr, session_id=None):
             seen["expr"] = expr
             return {"success": True, "result": json.dumps({"filled": 1})}
 
         with patch("agent.vault_store.get_vault_store", return_value=store), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_focus_form", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             raw = browser_vault_tool.browser_vault_enter_code(meta.id, task_id="t")
@@ -782,14 +837,14 @@ class TestTwoFactor:
         boxes = [{"index": i, "type": "tel", "name": f"digit{i}", "label": "", "autocomplete": "one-time-code",
                   "formIndex": 0, "maxLength": 1} for i in range(6)]
         seen = {}
-        fake_eval = lambda t, e: {"success": True, "result": json.dumps(boxes) if "querySelectorAll" in e else "https://acme.test/2fa"}
+        fake_eval = lambda t, e, s=None: {"success": True, "result": json.dumps(boxes) if "querySelectorAll" in e else "https://acme.test/2fa"}
 
-        def fake_secret(t, e):
+        def fake_secret(t, e, s=None):
             seen["expr"] = e
             return {"success": True, "result": json.dumps({"filled": 6})}
 
         with patch("agent.vault_backends.unlock.can_prompt_here", return_value=True), \
-             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_focus_form", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
              patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
@@ -821,8 +876,8 @@ class TestTwoFactor:
     def test_no_code_field_points_at_passkey_or_device_approval(self):
         from tools import browser_vault_tool
 
-        fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
-        with patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+        fake_eval = lambda t, e, s=None: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
+        with patch.object(browser_vault_tool, "_focus_form", lambda *a, **k: None), \
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field"

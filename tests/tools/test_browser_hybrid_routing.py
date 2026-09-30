@@ -130,6 +130,17 @@ class TestHybridRoutingSessionCreation:
         assert session["session_key"] == "default"
         assert session["owner_task_id"] == "default"
 
+    def test_named_exec_session_has_no_owning_task_and_stays_bound(self, monkeypatch):
+        """A named browser_exec session is shared by name: the task that last drove it keeps its binding."""
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr("tools.browser_tool_cdp._ensure_cdp_supervisor", lambda t: None)
+
+        session = bt_session._get_session_info("bu-named-x")
+        browser_tool._last_active_session_key["t1"] = "bu-named-x"
+
+        assert session["owner_task_id"] is None
+        assert browser_tool._last_session_key("t1") == "bu-named-x"
+
 
 class TestCleanupHybridSessions:
     """cleanup_browser(bare_task_id) must reap both cloud + local sidecar sessions."""

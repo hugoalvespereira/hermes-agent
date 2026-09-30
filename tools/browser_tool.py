@@ -335,6 +335,11 @@ def _bare_task_id_for_session_key(session_key: str) -> str:
     return session_key[: -len(_LOCAL_SUFFIX)] if _is_local_sidecar_key(session_key) else session_key
 
 
+def _session_owner_task_id(session_key: str) -> Optional[str]:
+    """Task that owns ``session_key``; None for a named browser_exec session (shared by name, owned by no task)."""
+    return None if session_key.startswith(NAMED_SESSION_PREFIX) else _bare_task_id_for_session_key(session_key)
+
+
 def _session_info_owned_by_task(session_info: Dict[str, Any], task_id: str, session_key: str) -> bool:
     """Ownership check; entries without metadata (older in-memory / hot-reload) pass,
     any explicit mismatch fails before a non-nav tool can act on the wrong session."""
@@ -378,6 +383,7 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # tool) so click/snapshot land in the session that served the last navigation.
 _last_active_session_key: Dict[str, str] = {}
 _LOCAL_SUFFIX = "::local"
+NAMED_SESSION_PREFIX = "bu-named-"  # browser_exec(session=<name>) keys: bu-named-<name>[@<profile tag>]
 _cleanup_done = False
 
 # Inactivity timeout: config.yaml is authoritative; BROWSER_INACTIVITY_TIMEOUT

@@ -388,7 +388,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
             return _bt._active_sessions[task_id]
         session_info = dict(session_info)
         session_info.setdefault("session_key", task_id)
-        session_info.setdefault("owner_task_id", _bt._bare_task_id_for_session_key(task_id))
+        session_info.setdefault("owner_task_id", _bt._session_owner_task_id(task_id))
         _bt._active_sessions[task_id] = session_info
         _bt._suspect_browser_sessions.pop(task_id, None)  # brand-new session is healthy by definition
 

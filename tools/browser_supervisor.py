@@ -208,9 +208,9 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _err(e)
         return {"ok": True, "dialog": dialog.to_dict()}
 
-    def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
+    def evaluate_runtime(self, expression: str, *, session_id: Optional[str] = None, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
-        """Evaluate ``expression`` in the page's Runtime context over the live WS.
+        """Evaluate ``expression`` in the page's (or ``session_id``'s frame) Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
@@ -218,7 +218,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
         with self._state_lock:
-            active, session_id = self._active, self._page_session_id
+            active, session_id = self._active, session_id or self._page_session_id
         if not active:
             return _fail("supervisor is not active")
         if not session_id:
@@ -264,12 +264,14 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         return {"ok": True, "result": value, "result_type": result_type}
 
     def focus_page(self, origin: str, *, accept: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
-        """Re-attach the supervisor's page session to an open page target on ``origin``
-        (``scheme://host[:port]``). The initial attach picks the FIRST page target, but tools
-        that open their own tabs (browser_exec) put the login form somewhere else. With
-        ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
-        so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        """Re-attach the supervisor's page session to the open tab holding a frame on ``origin``
+        (``scheme://host[:port]``; ``""`` = any http(s) origin). The initial attach picks the FIRST
+        page target, but tools that open their own tabs (browser_exec) put the login form somewhere
+        else, and the form may sit in a cross-origin iframe (OOPIF). Each tab's top document and its
+        OOPIFs are candidates; with ``accept`` (a JS expression) the first frame on ``origin`` where it
+        evaluates truthy wins, so a login and a checkout tab on one site resolve to the right one.
+        Returns ``{"ok": True, "url", "session_id"}`` naming the matched frame, or ``{"ok": False,
+        "error"}``; on failure the previous session stays."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -281,31 +283,33 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             await self._install_dialog_bridge(sid)
             return sid
 
-        async def _focus() -> Dict[str, Any]:
+        async def _matches(sid: str, url: str) -> bool:
             from agent.vault_store import normalize_origin
+            try:
+                if not url.startswith(("http://", "https://")) or (origin and normalize_origin(url) != origin):
+                    return False
+            except Exception:
+                return False
+            if not accept:
+                return True
+            probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
+                                    session_id=sid, timeout=timeout)
+            return bool(probe.get("result", {}).get("result", {}).get("value"))
+
+        async def _focus() -> Dict[str, Any]:
             targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
-            candidates = []
             for t in targets:
-                url = str(t.get("url") or "")
-                try:
-                    # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
-                    if t.get("type") == "page" and url.startswith(("http://", "https://")) \
-                            and (not origin or normalize_origin(url) == origin):
-                        candidates.append((t["targetId"], url))
-                except Exception:
+                if t.get("type") != "page" or not str(t.get("url") or "").startswith(("http://", "https://")):
                     continue
-            for target_id, url in candidates:
-                sid = await _attach(target_id)
-                if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
-                                            session_id=sid, timeout=timeout)
-                    if not probe.get("result", {}).get("result", {}).get("value"):
-                        await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
-                        continue
-                with self._state_lock:
-                    self._page_session_id = sid
-                return {"ok": True, "url": url}
-            return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
+                sid = await _attach(t["targetId"])
+                # setAutoAttach (in _attach) reports the tab's existing OOPIFs before it returns.
+                for frame_sid, url in [(sid, str(t.get("url") or ""))] + self.oopif_sessions(sid):
+                    if await _matches(frame_sid, url):
+                        with self._state_lock:
+                            self._page_session_id = sid
+                        return {"ok": True, "url": url, "session_id": frame_sid}
+                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+            return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept else ""))
 
         try:
             return _schedule(_focus(), loop, timeout=timeout + 1)

@@ -326,7 +326,8 @@ def _served_profile_tag() -> str:
 
 def _backend_cache_key(task_id: Optional[str], session_name: str = "") -> str:
     """Session-cache key for a backend browser: named sessions get their own; served profiles get their own."""
-    key = f"bu-named-{session_name}" if session_name else (task_id or "browser-exec-default")
+    from tools.browser_tool import NAMED_SESSION_PREFIX
+    key = f"{NAMED_SESSION_PREFIX}{session_name}" if session_name else (task_id or "browser-exec-default")
     tag = _served_profile_tag()
     return f"{key}@{tag}" if tag else key
 
@@ -497,10 +498,14 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+def _attach_vault_supervisor(env: dict, task_id: Optional[str], session_key: str) -> None:
     """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
     a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
-    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
+    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``.
+    Records ``session_key`` as the task's last driven session so everything resolving through
+    ``_last_session_key`` (vault CLI fallback, Bot Desktop fence) reaches the same browser."""
+    from tools import browser_tool as _bt
+    _bt._last_active_session_key[task_id or "default"] = session_key
     cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
     if not cdp:
         return
@@ -637,7 +642,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> Dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
+        _attach_vault_supervisor(env, task_id, _backend_cache_key(task_id, session))
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:

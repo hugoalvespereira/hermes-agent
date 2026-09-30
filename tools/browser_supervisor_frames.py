@@ -36,6 +36,9 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # Session the OOPIF was auto-attached from (its embedder's). Page.frameAttached is not replayed
+    # when the supervisor attaches to an already-loaded tab, so this is often the only parent link.
+    parent_session_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
@@ -75,6 +78,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                parent_session_id=old.parent_session_id,
             )
 
     def _on_frame_detached(self, params: Dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +109,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    parent_session_id=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +133,20 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def oopif_sessions(self, page_session_id: str) -> List[Tuple[str, str]]:
+        """``(child session id, url)`` of every live OOPIF nested under ``page_session_id``."""
+        with self._state_lock:
+            live = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        out = []
+        for sid, frame in live.items():
+            parent, seen = frame.parent_session_id, {sid}
+            while parent in live and parent not in seen:
+                seen.add(parent)
+                parent = live[parent].parent_session_id
+            if parent == page_session_id:
+                out.append((sid, frame.url))
+        return out
 
     def _build_frame_tree_locked(self) -> Dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

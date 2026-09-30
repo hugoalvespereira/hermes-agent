@@ -8,11 +8,12 @@ tools):
 - ``browser_vault_list``  → handles + metadata (for logins this includes the
   identifier — it is NOT a secret; the agent types it itself). Passwords are
   never returned.
-- ``browser_vault_fill``  → server-side fill of the CURRENT page from a vault
+- ``browser_vault_fill``  → server-side fill of the frame that holds the form from a vault
   handle: the password field for logins, card fields for payment items (after
   the user confirms), address fields for address items. The secret is
-  resolved locally, the page origin must EXACTLY match the item's bound
-  origin (pre-checked AND re-asserted synchronously inside the fill script),
+  resolved locally, that frame's origin must EXACTLY match the item's bound
+  origin (pre-checked AND re-asserted synchronously inside the fill script,
+  both in the same frame — a cross-origin iframe is checked on its own),
   the field is chosen by the ported login-control classifier, injection runs
   exclusively over the supervisor CDP WebSocket (never argv), and the tool
   result reports only ``{filled_fields, kind, origin, success}`` — the
@@ -29,7 +30,7 @@ from __future__ import annotations
 import json
 import secrets
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -53,20 +54,22 @@ def _check_vault_available() -> bool:
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
 
-def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
-    """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
+def _eval_js(task_id: str, expression: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Evaluate NON-SECRET JS on the current page, or in the frame of ``session_id``
+    (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
-    agent-browser CLI ``eval`` command. Never use this for expressions that
-    embed secret values — the fallback places the expression in subprocess
-    argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
+    agent-browser CLI ``eval`` command (top document only, so never for a
+    frame). Never use this for expressions that embed secret values — the
+    fallback places the expression in subprocess argv. Use
+    :func:`_eval_js_secret` for secret-bearing expressions.
     """
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
         supervisor = SUPERVISOR_REGISTRY.get(task_id)
         if supervisor is not None:
-            sup = supervisor.evaluate_runtime(expression)
+            sup = supervisor.evaluate_runtime(expression, session_id=session_id)
             if sup.get("ok"):
                 return {"success": True, "result": sup.get("result")}
             err = str(sup.get("error") or "")
@@ -76,6 +79,9 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
         pass
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
+    if session_id:
+        # The CLI cannot address a frame; falling through would silently inspect the top document.
+        return {"success": False, "error": "supervisor unavailable for the frame that holds the form"}
 
     from tools.browser_tool import _last_session_key
     from tools.browser_tool_session import _run_browser_command
@@ -116,7 +122,7 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
-def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js_secret(task_id: str, expression: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
@@ -155,7 +161,7 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
-    sup = supervisor.evaluate_runtime(expression)
+    sup = supervisor.evaluate_runtime(expression, session_id=session_id)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
     return {
@@ -176,8 +182,8 @@ def _parse_json_result(raw: Any) -> Any:
     return raw
 
 
-def _current_page_origin(task_id: str) -> Optional[str]:
-    res = _eval_js(task_id, "window.location.href")
+def _current_page_origin(task_id: str, session_id: Optional[str] = None) -> Optional[str]:
+    res = _eval_js(task_id, "window.location.href", session_id)
     if not res.get("success"):
         return None
     href = str(res.get("result") or "").strip().strip('"').strip("'")
@@ -199,18 +205,22 @@ _TAB_PROBES = {
 }
 
 
-def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
-    """Point the supervisor's page session at the open tab on ``origin`` that holds a ``kind`` form
-    (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
-    login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
+def _focus_form(task_id: str, origins: List[str], kind: str) -> Optional[str]:
+    """Point the supervisor's page session at the open tab holding a ``kind`` form on one of ``origins``
+    (``""`` = any site) and return the session id of the frame that holds it, which may be a cross-origin
+    iframe (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely
+    the login page). None when no supervisor or no tab matches (caller works on the current page)."""
     try:
         supervisor = _ensure_supervisor(task_id)
     except Exception:
         supervisor = None
     if supervisor is None:
         return None
-    focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
+    for origin in origins:
+        focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
+        if focused.get("ok"):
+            return focused.get("session_id")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +307,8 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     effective_task_id = task_id or "default"
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
+    session_id = _focus_form(effective_task_id, [""], "login")
+    origin = _current_page_origin(effective_task_id, session_id)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
     prompt = get_save_login_prompt_callback()
@@ -343,14 +353,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
-    origin = _current_page_origin(effective_task_id)
+    session_id = _focus_form(effective_task_id, [""], "otp")
+    origin = _current_page_origin(effective_task_id, session_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce), session_id)
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
@@ -383,7 +393,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce), session_id)
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
@@ -455,12 +465,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # every saved origin is a valid fill target. Matching stays exact-origin —
     # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
-    page_origin = None
-    for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
-        if page_origin:
-            break
-    page_origin = page_origin or _current_page_origin(effective_task_id)
+    session_id = _focus_form(effective_task_id, allowed, meta.kind)
+    page_origin = _current_page_origin(effective_task_id, session_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
@@ -480,7 +486,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(effective_task_id, build_inspection_js(nonce), session_id)
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -527,7 +533,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce), session_id
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.

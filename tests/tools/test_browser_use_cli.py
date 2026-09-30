@@ -250,6 +250,22 @@ class TestVaultSupervisorAttach:
         assert result["success"] is True
         assert _fake_supervisor_registry == [("t-vault", "ws://127.0.0.1:47000/devtools/browser/t-vault")]
 
+    def test_exec_on_named_session_binds_the_task_to_that_session(self, tmp_path, monkeypatch):
+        """The vault tools resolve the task's browser through _last_session_key: after browser_exec drove a
+        named session, that must be the named session's browser, not the task's default about:blank one."""
+        from tools import browser_tool
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
+        monkeypatch.setattr(browser_tool, "_last_active_session_key", {})
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho ok\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
+
+        result = json.loads(bu_cli.browser_exec("print(1)", session="dnb_finance", task_id="t-vault"))
+
+        assert result["success"] is True
+        assert browser_tool._last_active_session_key["t-vault"] == "bu-named-dnb_finance"
+
 
 class TestVaultEgressRedaction:
     def test_exec_redacts_registered_vault_secret_from_stdout_and_stderr(self, tmp_path, monkeypatch):
