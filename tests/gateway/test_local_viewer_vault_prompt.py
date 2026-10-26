@@ -176,15 +176,15 @@ def _enter_code_with_a_fake_page():
     controls = [{'index': 0, 'type': 'text', 'name': 'otp', 'label': 'Security code', 'autocomplete': 'one-time-code'}]
     seen = {}
 
-    def fake_eval(task_id, expr):
+    def fake_eval(task_id, expr, frame=None):
         return {'success': True, 'result': json.dumps(controls) if 'querySelectorAll' in expr
                 else 'https://www.epicgames.com/id/login/mfa'}
 
-    def fake_secret(task_id, expr):
+    def fake_secret(task_id, expr, frame=None):
         seen['expr'] = expr
         return {'success': True, 'result': json.dumps({'filled': 1})}
 
-    with patch.object(browser_vault_tool, '_focus_bound_origin', lambda *a, **k: None), \
+    with patch.object(browser_vault_tool, '_focus_form', lambda *a, **k: None), \
          patch.object(browser_vault_tool, '_eval_js', side_effect=fake_eval), \
          patch.object(browser_vault_tool, '_eval_js_secret', side_effect=fake_secret):
         raw = browser_vault_tool.browser_vault_enter_code(task_id='t')

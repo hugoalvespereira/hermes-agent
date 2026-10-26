@@ -36,12 +36,24 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # Session the OOPIF was auto-attached from (its embedder's). Page.frameAttached is not replayed
+    # when the supervisor attaches to an already-loaded tab, so this is often the only parent link.
+    parent_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
         optional = (("session_id", self.cdp_session_id), ("parent_frame_id", self.parent_frame_id), ("name", self.name))
         d.update({k: v for k, v in optional if v})
         return d
+
+
+@dataclass(frozen=True)
+class FrameTarget:
+    """Where Runtime.evaluate runs: a CDP session plus an execution context created in ONE frame of it.
+    The context dies with that frame's document, so a navigated frame can no longer be evaluated in."""
+
+    session_id: str
+    context_id: int
 
 
 class FrameTrackingMixin:
@@ -75,6 +87,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                parent_session_id=old.parent_session_id,
             )
 
     def _on_frame_detached(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +118,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    parent_session_id=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +142,39 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def oopif_sessions(self, page_session_id: str) -> list[tuple[str, str]]:
+        """``(child session id, url)`` of every live OOPIF nested under ``page_session_id``."""
+        with self._state_lock:
+            live = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        out = []
+        for sid, frame in live.items():
+            parent, seen = frame.parent_session_id, {sid}
+            while parent in live and parent not in seen:
+                seen.add(parent)
+                parent = live[parent].parent_session_id
+            if parent == page_session_id:
+                out.append((sid, frame.url))
+        return out
+
+    async def _local_frames(self, session_id: str, *, timeout: float) -> list[tuple[str, str]]:
+        """``(frame_id, url)`` of every frame rendered in ``session_id``'s process, top first. Same-site
+        iframes live here with no session of their own; ``Page.getFrameTree`` omits OOPIF children, which
+        are separate sessions (see ``oopif_sessions``)."""
+        tree = (await self._cdp("Page.getFrameTree", session_id=session_id, timeout=timeout)).get("result", {})
+        out, stack = [], [tree.get("frameTree") or {}]
+        while stack:
+            node = stack.pop(0)
+            frame = node.get("frame") or {}
+            if frame.get("id"):
+                out.append((frame["id"], str(frame.get("url") or "")))
+            stack.extend(node.get("childFrames") or [])
+        return out
+
+    async def _frame_context(self, session_id: str, frame_id: str, *, timeout: float) -> FrameTarget:
+        """An isolated-world execution context bound to ``frame_id``'s current document."""
+        world = await self._cdp("Page.createIsolatedWorld", {"frameId": frame_id}, session_id=session_id, timeout=timeout)
+        return FrameTarget(session_id, int(world["result"]["executionContextId"]))
 
     def _build_frame_tree_locked(self) -> dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

@@ -179,11 +179,11 @@ def page(monkeypatch):
 
     secret_evals = []
     state = SimpleNamespace(origin=ORIGIN, secret_evals=secret_evals)
-    monkeypatch.setattr(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None)
-    monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id: state.origin)
-    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": json.dumps(_CONTROLS)})
+    monkeypatch.setattr(browser_vault_tool, "_focus_form", lambda *a, **k: None)
+    monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task_id, frame=None: state.origin)
+    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr, frame=None: {"success": True, "result": json.dumps(_CONTROLS)})
 
-    def secret_eval(task_id, expression):
+    def secret_eval(task_id, expression, frame=None):
         secret_evals.append(expression)
         return {"success": True, "result": json.dumps({"filled": 1})}
 
@@ -420,9 +420,9 @@ def test_plugin_otp_is_minted_and_written_inside_the_backends_fill_context(vault
     load(["ctx_vault"], {"ctxvault": "true"})
     backend = _backend("ctxvault")
     otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
-    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr: {"success": True, "result": json.dumps([otp_field])})
+    monkeypatch.setattr(browser_vault_tool, "_eval_js", lambda task_id, expr, frame=None: {"success": True, "result": json.dumps([otp_field])})
 
-    def secret_eval(task_id, expression):
+    def secret_eval(task_id, expression, frame=None):
         backend.calls.append("write")
         page.secret_evals.append(expression)
         return {"success": True, "result": json.dumps({"filled": 1})}
@@ -443,7 +443,7 @@ def _ctx_backend(vault_home, page, monkeypatch, code="739251"):
     load(["ctx_vault"], {"ctxvault": "true"})
     otp_field = {"autocomplete": "one-time-code", "formIndex": 0, "index": 0, "label": "", "name": "otp", "type": "text"}
     monkeypatch.setattr(browser_vault_tool, "_eval_js",
-                        lambda task_id, expr: {"success": True, "result": json.dumps(_CONTROLS + [otp_field])})
+                        lambda task_id, expr, frame=None: {"success": True, "result": json.dumps(_CONTROLS + [otp_field])})
     return _backend("ctxvault")
 
 

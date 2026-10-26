@@ -53,7 +53,7 @@ class _FakePage:
     def focus_page(self, origin: str, accept=None) -> dict:
         return {"ok": bool(origin) and normalize_origin(self.href) == origin, "url": self.href}
 
-    def evaluate_runtime(self, expression: str) -> dict:
+    def evaluate_runtime(self, expression: str, frame=None) -> dict:
         if expression.strip() == "window.location.href":
             return {"ok": True, "result": self.href}
         if "expectedOrigin" in expression:  # the fill script (build_fill_js)
