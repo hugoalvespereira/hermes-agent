@@ -12,6 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 # Logger-name parity with the origin module (records must look unchanged).
 logger = logging.getLogger("tools.browser_supervisor")
@@ -21,6 +22,18 @@ FRAME_TREE_MAX_ENTRIES = 30
 FRAME_TREE_MAX_OOPIF_DEPTH = 2
 
 _AUTO_ATTACH_PARAMS = {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True}
+
+
+def _is_web_url(url: str) -> bool:
+    return url.startswith(("http://", "https://"))
+
+
+def _may_share_site(url: str, origin: str) -> bool:
+    """False only when ``url`` provably is not same-site with ``origin``: another scheme or other last two host
+    labels. A registrable domain has at least two labels, so a same-site URL is never rejected; siblings under a
+    multi-label suffix (``a.co.uk`` / ``b.co.uk``) pass too, which only costs an extra candidate."""
+    a, b = urlsplit(url), urlsplit(origin)
+    return a.scheme == b.scheme and (a.hostname or "").split(".")[-2:] == (b.hostname or "").split(".")[-2:]
 
 
 @dataclass
@@ -59,7 +72,7 @@ class FrameTarget:
 class FrameTrackingMixin:
     """Frame-tree bookkeeping for ``CDPSupervisor`` (event handlers run on its loop)."""
 
-    async def _enable_page_domains(self, session_id: Optional[str], *, timeout: float) -> None:
+    async def _enable_page_domains(self, session_id: Optional[str], *, timeout: Optional[float]) -> None:
         """Page.enable + Runtime.enable + nested auto-attach on one session."""
         await self._cdp("Page.enable", session_id=session_id, timeout=timeout)
         await self._cdp("Runtime.enable", session_id=session_id, timeout=timeout)
@@ -156,6 +169,39 @@ class FrameTrackingMixin:
             if parent == page_session_id:
                 out.append((sid, frame.url))
         return out
+
+    @staticmethod
+    def _candidate_pages(targets: list[dict[str, Any]], origin: str) -> list[str]:
+        """http(s) page target ids worth probing for a frame on ``origin`` (``""`` = every one), from the
+        ``Target.getTargets`` reply alone: a background tab answers browser-side commands but may answer no
+        renderer command. Under site isolation a frame renders in a same-site local root (the page or an OOPIF
+        target), so a tab none of whose targets may share ``origin``'s site cannot hold it and is left out.
+        Tabs owning a target exactly on ``origin`` come first, then the site-sharing ones, each in tab order;
+        a site-sharing OOPIF whose tab is unknown (parented by an in-process subframe) keeps every tab."""
+        pages = [t["targetId"] for t in targets if t.get("type") == "page" and _is_web_url(str(t.get("url") or ""))]
+        if not origin:
+            return pages
+        from agent.vault_store import VaultError, normalize_origin
+        by_id = {t.get("targetId"): t for t in targets}
+        exact, site, unplaced = set(), set(), False
+        for t in targets:
+            url = str(t.get("url") or "")
+            if t.get("type") not in {"page", "iframe"} or not _is_web_url(url) or not _may_share_site(url, origin):
+                continue
+            # An OOPIF's frame id is its target id, so parentFrameId walks up to the owning page.
+            owner, seen = t, set()
+            while owner is not None and owner.get("type") == "iframe" and owner.get("targetId") not in seen:
+                seen.add(owner.get("targetId"))
+                owner = by_id.get(owner.get("parentFrameId"))
+            if owner is None:  # parented by an in-process subframe: its tab is unknown
+                unplaced = True
+                continue
+            try:
+                (exact if normalize_origin(url) == origin else site).add(owner["targetId"])
+            except VaultError:
+                site.add(owner["targetId"])
+        ranked = [p for p in pages if p in exact] + [p for p in pages if p in site - exact]
+        return ranked + [p for p in pages if p not in ranked] if unplaced else ranked
 
     async def _local_frames(self, session_id: str, *, timeout: float) -> list[tuple[str, str]]:
         """``(frame_id, url)`` of every frame rendered in ``session_id``'s process, top first. Same-site

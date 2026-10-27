@@ -69,7 +69,10 @@ frozen snapshot without awaiting.
 
 - **Start:** `SupervisorRegistry.get_or_start(task_id, cdp_url)` — called when
   `browser_exec` attaches to a session (local, cloud provider or CDP override)
-  and on `/browser connect`. Idempotent.
+  and on `/browser connect`. Idempotent. The first page target's setup (domains,
+  auto-attach, dialog bridge) is awaited up to `INITIAL_PAGE_SETUP_TIMEOUT_S`; a
+  background tab that never answers `Page.enable` no longer fails the start, and its
+  setup completes if the tab later answers.
 - **Stop:** session teardown or `/browser disconnect`. Cancels the asyncio
   task, closes the WebSocket, discards state.
 - **Dropped endpoint:** after a successful attach the supervisor reconnects with
@@ -216,7 +219,13 @@ agent uses `contentWindow`/`contentDocument` from a top-level
 fallback when `frame_id` belongs to a non-OOPIF.
 
 The vault tools (`browser_vault_fill`, `browser_vault_save_login`,
-`browser_vault_enter_code`) address any frame, not only OOPIFs: `focus_page`
+`browser_vault_enter_code`) address any frame, not only OOPIFs. `focus_page`
+first ranks tabs from `Target.getTargets` alone, since a background tab may answer
+no renderer command: tabs owning a page or OOPIF target exactly on the origin come
+first, then tabs owning one that may share its site (`parentFrameId` links an OOPIF
+to its tab); under site isolation any other tab cannot hold the frame and is never
+attached. Each candidate is probed under its own timeout, so a stalled tab is
+skipped rather than aborting the search. In a probed tab, `focus_page`
 lists each session's frames with `Page.getFrameTree` (the tab's session plus
 each OOPIF session) and binds the matching one with `Page.createIsolatedWorld`.
 The resulting `FrameTarget` (session id + execution context id) is where the

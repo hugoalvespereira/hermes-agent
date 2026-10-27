@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # once its process exits; leave enough room for the former without leaking a
 # supervisor thread and warnings forever for the latter.
 MAX_POST_ATTACH_RECONNECT_FAILURES = 5
+# A background tab answers browser-side CDP commands but may never answer Page.enable; past this
+# bound start() proceeds without waiting for the initial page's setup (it still completes if the tab answers).
+INITIAL_PAGE_SETUP_TIMEOUT_S = 10.0
 
 
 def _redact_cdp_error_text(exc: object) -> str:
@@ -52,6 +55,12 @@ def _redact_cdp_error_text(exc: object) -> str:
         return redact_cdp_url(str(exc))
     except Exception:
         return "<error redacted>"
+
+
+def _log_late_setup(setup: asyncio.Future) -> None:
+    """Retrieve the outcome of an initial-page setup that outlived ``start()``."""
+    if not setup.cancelled() and (exc := setup.exception()):
+        logger.debug("CDP supervisor: initial page setup failed: %s", exc)
 
 
 class _LoopUnavailable(RuntimeError):
@@ -271,21 +280,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         """Re-attach the supervisor's page session to the open tab holding a frame on ``origin``
         (``scheme://host[:port]``; ``""`` = any http(s) origin). The initial attach picks the FIRST
         page target, but tools that open their own tabs (browser_exec) put the login form somewhere
-        else, and the form may sit in a cross-origin iframe. Each frame of each tab, in-process (same-site)
-        or OOPIF (cross-site), is a candidate; with ``accept`` (a JS expression) the first frame on
-        ``origin`` where it evaluates truthy wins, so a login and a checkout tab on one site resolve to
+        else, and the form may sit in a cross-origin iframe. Tabs are ranked from target metadata
+        (``_candidate_pages``) and each is probed under its own ``timeout``, so a stalled tab is skipped.
+        Each frame of a probed tab, in-process (same-site) or OOPIF (cross-site), is a candidate; with
+        ``accept`` (a JS expression) the first frame on ``origin`` where it evaluates truthy wins, so a login and a checkout tab on one site resolve to
         the right one. Returns ``{"ok": True, "url", "frame"}`` with the matched frame's ``FrameTarget``,
         or ``{"ok": False, "error"}``; on failure the previous session stays."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
-
-        async def _attach(target_id: str) -> str:
-            attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
-            sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
-            return sid
 
         async def _resolve(sid: str, frame_id: str, url: str) -> Optional[FrameTarget]:
             from agent.vault_store import normalize_origin
@@ -302,24 +305,45 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                                     session_id=sid, timeout=timeout)
             return target if probe.get("result", {}).get("result", {}).get("value") else None
 
-        async def _focus() -> dict[str, Any]:
-            targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
-            for t in targets:
-                if t.get("type") != "page" or not str(t.get("url") or "").startswith(("http://", "https://")):
+        async def _search(sid: str) -> Optional[tuple[str, FrameTarget]]:
+            await self._enable_page_domains(sid, timeout=timeout)
+            await self._install_dialog_bridge(sid)
+            # setAutoAttach (in _enable_page_domains) reports the tab's existing OOPIFs before it returns.
+            for frame_sid in [sid] + [s for s, _ in self.oopif_sessions(sid)]:
+                for frame_id, url in await self._local_frames(frame_sid, timeout=timeout):
+                    if target := await _resolve(frame_sid, frame_id, url):
+                        return url, target
+            return None
+
+        async def _focus(candidates: list[str]) -> dict[str, Any]:
+            for target_id in candidates:
+                try:
+                    attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True},
+                                             timeout=timeout)
+                except Exception as exc:  # closed since Target.getTargets
+                    logger.debug("focus_page: attach to %s failed: %s", target_id[:16], exc)
                     continue
-                sid = await _attach(t["targetId"])
-                # setAutoAttach (in _attach) reports the tab's existing OOPIFs before it returns.
-                for frame_sid in [sid] + [s for s, _ in self.oopif_sessions(sid)]:
-                    for frame_id, url in await self._local_frames(frame_sid, timeout=timeout):
-                        if target := await _resolve(frame_sid, frame_id, url):
-                            with self._state_lock:
-                                self._page_session_id = sid
-                            return {"ok": True, "url": url, "frame": target}
-                await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+                sid = attach["result"]["sessionId"]
+                # A background tab may never answer a renderer command: bound it and move on. wait_for
+                # cancels the probe, so a late answer from that tab cannot take the page session.
+                try:
+                    found = await asyncio.wait_for(_search(sid), timeout)
+                except Exception as exc:
+                    logger.debug("focus_page: skipped tab %s: %s", target_id[:16], exc)
+                    found = None
+                if found:
+                    with self._state_lock:
+                        self._page_session_id = sid
+                    return {"ok": True, "url": found[0], "frame": found[1]}
+                with contextlib.suppress(Exception):
+                    await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept else ""))
 
         try:
-            return _schedule(_focus(), loop, timeout=timeout + 1)
+            targets = _schedule(self._cdp("Target.getTargets", timeout=timeout), loop, timeout=timeout + 1)
+            candidates = self._candidate_pages(targets.get("result", {}).get("targetInfos", []), origin)
+            # Attach, search and detach are each bounded by ``timeout`` per candidate.
+            return _schedule(_focus(candidates), loop, timeout=3 * timeout * len(candidates) + 1)
         except Exception as exc:
             return _err(exc)
 
@@ -447,14 +471,23 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             backoff = min(backoff * 2, 10.0)
 
     async def _attach_initial_page(self) -> None:
-        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
+        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge. The setup is
+        awaited up to ``INITIAL_PAGE_SETUP_TIMEOUT_S``; a stalled background tab must not fail ``start()``."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
         page_target = next((t for t in targets if t.get("type") == "page"), None)
         if page_target is None:
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
         self._page_session_id = sid = attach["result"]["sessionId"]
-        await self._enable_page_domains(sid, timeout=10.0)
+        setup = asyncio.ensure_future(self._setup_initial_page(sid))
+        done, _ = await asyncio.wait({setup}, timeout=INITIAL_PAGE_SETUP_TIMEOUT_S)
+        if setup in done:
+            setup.result()  # a live page is ready only once set up; a setup error fails start
+        else:
+            setup.add_done_callback(_log_late_setup)
+
+    async def _setup_initial_page(self, sid: str) -> None:
+        await self._enable_page_domains(sid, timeout=None)
         await self._install_dialog_bridge(sid)
 
     async def _cdp(self, method: str, params: Optional[dict[str, Any]] = None, *,
