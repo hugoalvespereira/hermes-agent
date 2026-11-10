@@ -57,7 +57,9 @@ def check_api_turn(authority, ref, payload):
         # 'browser_control' is accepted and ignored: admissions persisted while the removed
         # browser-extension control existed may carry it and must still recover.
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata', 'resume_unanswered'}
+                         'relay_metadata', 'resume_unanswered', 'user_id'}
+                or ('user_id' in data and not (isinstance(data['user_id'], str)
+                                               and re.fullmatch(r'[a-z0-9_-]{1,64}', data['user_id'])))
                 or data.get('resume_unanswered', True) is not True
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
@@ -191,6 +193,9 @@ def admit_api_steps(adapter, **kwargs):
         # The request's Relay metadata rides the admission to the turn it describes (main passed it
         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
         payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+    if kwargs.get('user_id'):
+        # The authenticated caller's end-user (Chat Completions ``user``): scopes this turn's memory.
+        payload['api_turn_v1']['user_id'] = kwargs['user_id']
     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
     if not isinstance(kwargs['user_message'], list):
         return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))
@@ -446,6 +451,7 @@ def prepare_api_execution(authority, ref, payload):
         content = restore_api_images(content, data.get('media') or [])
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
+            'user_id': data.get('user_id') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
             'resume_unanswered': bool(data and data.get('resume_unanswered'))}
 

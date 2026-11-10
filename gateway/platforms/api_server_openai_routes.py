@@ -896,6 +896,11 @@ class OpenAICompatRoutesMixin:
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        # Optional end-user identity (OpenAI ``user`` field) for per-user long-term memory, e.g. the
+        # Honcho user peer. Accepted only from authenticated callers, like X-Hermes-Session-Key.
+        user_id = body.get("user")
+        if user_id is not None and (not isinstance(user_id, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", user_id)):
+            return _invalid_request("Invalid 'user' field")
         # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
         # requires a configured API key or any client could read history by guessing ids.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
@@ -955,7 +960,7 @@ class OpenAICompatRoutesMixin:
             # and the client can resume the session by sending it again). A fingerprint-derived
             # id from a header-less client is NOT: delegate_task keeps its forced-sync fallback
             # there — the wake would hard-fail or land in history that client never reloads.
-            session_history_delivery=("1" if provided_session_id else ""))
+            session_history_delivery=("1" if provided_session_id else ""), user_id=user_id)
         run_kwargs.update(self._authority_chat_kwargs(request, provided_session_id))
         # This is presentation only. The ordinary API-key/session authorization
         # above still applies; it grants no internal ingress or control authority.
@@ -1003,14 +1008,14 @@ class OpenAICompatRoutesMixin:
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=(provided_session_id or session_id),
-                gateway_session_key=gateway_session_key)
+                gateway_session_key=gateway_session_key, user_id=user_id)
 
         async def _compute_completion():
             return await self._run_agent(**run_kwargs)
         outcome, err = await self._run_idempotent(
             request, body, _compute_completion, log_label="chat completions",
             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream",
-                              "hermes_notification_category"],
+                              "hermes_notification_category", "user"],
             route="chat_completions",
         )
         if err is not None:
@@ -1029,6 +1034,8 @@ class OpenAICompatRoutesMixin:
         response_headers = {"X-Hermes-Session-Id": (provided_session_id or result.get("session_id", session_id))}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if user_id:
+            response_headers["X-Hermes-User"] = user_id
         # Hard fail (no usable text AND a real failure) -> 502 OpenAI error envelope so SDK
         # clients raise instead of rendering the failure string as message.content.
         if not final_response and (is_failed or is_partial):
@@ -1140,6 +1147,7 @@ class OpenAICompatRoutesMixin:
 
     async def _prepare_sse_response(
         self, request: web.Request, session_id: Optional[str], gateway_session_key: Optional[str],
+        user_id: Optional[str] = None,
     ) -> web.StreamResponse:
         """Open a prepared SSE StreamResponse with CORS + session headers (the CORS middleware
         can't inject headers after ``prepare()`` flushes them, so they are resolved here)."""
@@ -1148,6 +1156,8 @@ class OpenAICompatRoutesMixin:
             sse_headers["X-Hermes-Session-Id"] = session_id
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if user_id:
+            sse_headers["X-Hermes-User"] = user_id
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
         return response
@@ -1155,12 +1165,12 @@ class OpenAICompatRoutesMixin:
     async def _write_sse_chat_completion(
         self, request: web.Request, completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str | None = None,
-        gateway_session_key: str | None = None) -> web.StreamResponse:
+        gateway_session_key: str | None = None, user_id: str | None = None) -> web.StreamResponse:
         """Stream ``chat.completion.chunk`` frames from the agent's delta queue. On client
         disconnect the agent is interrupted (stops LLM calls), then its task wrapper cancelled."""
         from gateway.platforms.api_server import (
             _abandon_agent_task, _chat_usage_payload, _resolve_media_to_data_urls, _sse_frame)
-        response = await self._prepare_sse_response(request, session_id, gateway_session_key)
+        response = await self._prepare_sse_response(request, session_id, gateway_session_key, user_id)
 
         def _chunk(delta: dict[str, Any], finish_reason=None, **extra) -> dict[str, Any]:
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,

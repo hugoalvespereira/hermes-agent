@@ -4,6 +4,7 @@ and build the kwargs ``MemoryProvider.initialize`` receives."""
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import suppress
 from typing import Any
 
@@ -136,6 +137,11 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
         _val = getattr(agent, f"_{_ident}")
         if _val:
             kwargs[_ident] = _val
+    # An admitted API turn whose authenticated caller named its end-user (Chat Completions ``user``).
+    _api_turn = sys.modules.get("gateway.session_api_turn")
+    _api_user = (_api_turn.api_execution.get() or {}).get("user_id") if _api_turn else None
+    if _api_user:
+        kwargs["user_id"] = _api_user
     if agent.session_cwd:
         kwargs["cwd"] = agent.session_cwd
     # Profile identity for per-profile provider scoping
