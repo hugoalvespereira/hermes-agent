@@ -12,6 +12,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 # Logger-name parity with the origin module (records must look unchanged).
 logger = logging.getLogger("tools.browser_supervisor")
@@ -21,6 +22,18 @@ FRAME_TREE_MAX_ENTRIES = 30
 FRAME_TREE_MAX_OOPIF_DEPTH = 2
 
 _AUTO_ATTACH_PARAMS = {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True}
+
+
+def _is_web_url(url: str) -> bool:
+    return url.startswith(("http://", "https://"))
+
+
+def _may_share_site(url: str, origin: str) -> bool:
+    """False only when ``url`` provably is not same-site with ``origin``: another scheme or other last two host
+    labels. A registrable domain has at least two labels, so a same-site URL is never rejected; siblings under a
+    multi-label suffix (``a.co.uk`` / ``b.co.uk``) pass too, which only costs an extra candidate."""
+    a, b = urlsplit(url), urlsplit(origin)
+    return a.scheme == b.scheme and (a.hostname or "").split(".")[-2:] == (b.hostname or "").split(".")[-2:]
 
 
 @dataclass
@@ -36,6 +49,9 @@ class FrameInfo:
     is_oopif: bool
     cdp_session_id: Optional[str] = None
     name: str = ""
+    # Session the OOPIF was auto-attached from (its embedder's). Page.frameAttached is not replayed
+    # when the supervisor attaches to an already-loaded tab, so this is often the only parent link.
+    parent_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {"frame_id": self.frame_id, "url": self.url, "origin": self.origin, "is_oopif": self.is_oopif}
@@ -44,10 +60,19 @@ class FrameInfo:
         return d
 
 
+@dataclass(frozen=True)
+class FrameTarget:
+    """Where Runtime.evaluate runs: a CDP session plus an execution context created in ONE frame of it.
+    The context dies with that frame's document, so a navigated frame can no longer be evaluated in."""
+
+    session_id: str
+    context_id: int
+
+
 class FrameTrackingMixin:
     """Frame-tree bookkeeping for ``CDPSupervisor`` (event handlers run on its loop)."""
 
-    async def _enable_page_domains(self, session_id: Optional[str], *, timeout: float) -> None:
+    async def _enable_page_domains(self, session_id: Optional[str], *, timeout: Optional[float]) -> None:
         """Page.enable + Runtime.enable + nested auto-attach on one session."""
         await self._cdp("Page.enable", session_id=session_id, timeout=timeout)
         await self._cdp("Runtime.enable", session_id=session_id, timeout=timeout)
@@ -75,6 +100,7 @@ class FrameTrackingMixin:
                 origin=str(frame.get("securityOrigin") or frame.get("origin") or ""),
                 parent_frame_id=frame.get("parentId") or old.parent_frame_id, is_oopif=old.is_oopif,
                 cdp_session_id=old.cdp_session_id, name=str(frame.get("name") or old.name),
+                parent_session_id=old.parent_session_id,
             )
 
     def _on_frame_detached(self, params: dict[str, Any], session_id: Optional[str]) -> None:
@@ -105,6 +131,7 @@ class FrameTrackingMixin:
                 self._frames[target_id] = FrameInfo(
                     frame_id=target_id, url=str(info.get("url") or ""), origin="", is_oopif=True, cdp_session_id=sid,
                     parent_frame_id=old.parent_frame_id if old else None, name=str(info.get("title") or (old.name if old else "")),
+                    parent_session_id=session_id,
                 )
         # Enable child domains off-loop: awaiting the replies here would deadlock
         # because only the reader can resolve those Futures.
@@ -128,6 +155,72 @@ class FrameTrackingMixin:
         with self._state_lock:
             self._frames.update({fid: replace(f, cdp_session_id=None) for fid, f in self._frames.items()
                                  if f.cdp_session_id == sid})
+
+    def oopif_sessions(self, page_session_id: str) -> list[tuple[str, str]]:
+        """``(child session id, url)`` of every live OOPIF nested under ``page_session_id``."""
+        with self._state_lock:
+            live = {f.cdp_session_id: f for f in self._frames.values() if f.is_oopif and f.cdp_session_id}
+        out = []
+        for sid, frame in live.items():
+            parent, seen = frame.parent_session_id, {sid}
+            while parent in live and parent not in seen:
+                seen.add(parent)
+                parent = live[parent].parent_session_id
+            if parent == page_session_id:
+                out.append((sid, frame.url))
+        return out
+
+    @staticmethod
+    def _candidate_pages(targets: list[dict[str, Any]], origin: str) -> list[str]:
+        """http(s) page target ids worth probing for a frame on ``origin`` (``""`` = every one), from the
+        ``Target.getTargets`` reply alone: a background tab answers browser-side commands but may answer no
+        renderer command. Under site isolation a frame renders in a same-site local root (the page or an OOPIF
+        target), so a tab none of whose targets may share ``origin``'s site cannot hold it and is left out.
+        Tabs owning a target exactly on ``origin`` come first, then the site-sharing ones, each in tab order;
+        a site-sharing OOPIF whose tab is unknown (parented by an in-process subframe) keeps every tab."""
+        pages = [t["targetId"] for t in targets if t.get("type") == "page" and _is_web_url(str(t.get("url") or ""))]
+        if not origin:
+            return pages
+        from agent.vault_store import VaultError, normalize_origin
+        by_id = {t.get("targetId"): t for t in targets}
+        exact, site, unplaced = set(), set(), False
+        for t in targets:
+            url = str(t.get("url") or "")
+            if t.get("type") not in {"page", "iframe"} or not _is_web_url(url) or not _may_share_site(url, origin):
+                continue
+            # An OOPIF's frame id is its target id, so parentFrameId walks up to the owning page.
+            owner, seen = t, set()
+            while owner is not None and owner.get("type") == "iframe" and owner.get("targetId") not in seen:
+                seen.add(owner.get("targetId"))
+                owner = by_id.get(owner.get("parentFrameId"))
+            if owner is None:  # parented by an in-process subframe: its tab is unknown
+                unplaced = True
+                continue
+            try:
+                (exact if normalize_origin(url) == origin else site).add(owner["targetId"])
+            except VaultError:
+                site.add(owner["targetId"])
+        ranked = [p for p in pages if p in exact] + [p for p in pages if p in site - exact]
+        return ranked + [p for p in pages if p not in ranked] if unplaced else ranked
+
+    async def _local_frames(self, session_id: str, *, timeout: float) -> list[tuple[str, str]]:
+        """``(frame_id, url)`` of every frame rendered in ``session_id``'s process, top first. Same-site
+        iframes live here with no session of their own; ``Page.getFrameTree`` omits OOPIF children, which
+        are separate sessions (see ``oopif_sessions``)."""
+        tree = (await self._cdp("Page.getFrameTree", session_id=session_id, timeout=timeout)).get("result", {})
+        out, stack = [], [tree.get("frameTree") or {}]
+        while stack:
+            node = stack.pop(0)
+            frame = node.get("frame") or {}
+            if frame.get("id"):
+                out.append((frame["id"], str(frame.get("url") or "")))
+            stack.extend(node.get("childFrames") or [])
+        return out
+
+    async def _frame_context(self, session_id: str, frame_id: str, *, timeout: float) -> FrameTarget:
+        """An isolated-world execution context bound to ``frame_id``'s current document."""
+        world = await self._cdp("Page.createIsolatedWorld", {"frameId": frame_id}, session_id=session_id, timeout=timeout)
+        return FrameTarget(session_id, int(world["result"]["executionContextId"]))
 
     def _build_frame_tree_locked(self) -> dict[str, Any]:
         """Capped frame_tree payload (must hold state lock). Top frame = one with

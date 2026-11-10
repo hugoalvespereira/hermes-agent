@@ -215,6 +215,16 @@ agent uses `contentWindow`/`contentDocument` from a top-level
 `Runtime.evaluate` instead — the supervisor surfaces an error pointing at that
 fallback when `frame_id` belongs to a non-OOPIF.
 
+The vault tools (`browser_vault_fill`, `browser_vault_save_login`,
+`browser_vault_enter_code`) address any frame, not only OOPIFs: `focus_page`
+lists each session's frames with `Page.getFrameTree` (the tab's session plus
+each OOPIF session) and binds the matching one with `Page.createIsolatedWorld`.
+The resulting `FrameTarget` (session id + execution context id) is where the
+origin read, inspection and fill all run, so a same-site iframe (rendered in
+the parent's process, no session of its own) and a cross-site OOPIF go through
+one path. The context dies with the frame's document, so a navigated frame
+cannot receive the fill.
+
 On Browserbase, this is the only reliable path for iframe interaction —
 stateless CDP connections (opened per `browser_cdp` call) hit signed-URL
 expiry, while the supervisor's long-lived connection keeps a valid session.
